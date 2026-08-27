@@ -51,8 +51,8 @@ public abstract class IndexedTable extends BaseTable {
   protected final AggregationFunction[] _aggregationFunctions;
   protected final boolean _hasOrderBy;
   protected final TableResizer _tableResizer;
-  protected final int _trimSize;
-  protected final int _trimThreshold;
+  protected int _trimSize;
+  protected int _trimThreshold;
   protected final int _numThreadsExtractFinalResult;
   protected final int _chunkSizeExtractFinalResult;
 
@@ -135,6 +135,15 @@ public abstract class IndexedTable extends BaseTable {
       }
     }
     return existingRecord;
+  }
+
+  /// Shrinks the trim size/threshold used by future [#resize()] calls. Monotonic by convention (callers
+  /// should only ever shrink, never grow, since entries already discarded by a previous trim cannot be
+  /// recovered) -- used by adaptive-capacity shard implementations that start conservative and narrow
+  /// down once they gather enough local evidence that a smaller capacity is safe.
+  protected void shrinkTrimSizeAndThreshold(int trimSize, int trimThreshold) {
+    _trimSize = trimSize;
+    _trimThreshold = trimThreshold;
   }
 
   /// Resizes the lookup map based on the trim size.
