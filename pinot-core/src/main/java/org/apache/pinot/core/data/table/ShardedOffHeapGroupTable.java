@@ -31,7 +31,18 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public class ShardedOffHeapGroupTable implements AutoCloseable {
   private static final double MEDIUM_TOP1_SHARE_THRESHOLD = 0.01;
   private static final double SMALL_TOP1_SHARE_THRESHOLD = 0.05;
-  private static final long MIN_SAMPLES_BEFORE_ADAPTATION = 500;
+  // Scaling the gate by shard.size() (distinct-key count) was tried and measured wrong, not just
+  // mistuned: a Zipfian tail keeps adding distinct keys as cardinality grows even after the HEAD (the
+  // only thing top1Share actually depends on) has long since stabilized, so the required-sample count
+  // kept climbing with cardinality while the real per-shard sample budget (driven by query throughput,
+  // not key cardinality) does not. Measured effect: at skew=1.0 the gate stopped triggering for most
+  // shards at all (1.5-9% memory reduction instead of the 96-98% Direction A achieves with the same
+  // signal/thresholds) and, backwards from what adaptive capacity needs, got WORSE as cardinality grew
+  // from 320K to 20M. Reverted to a flat sample count, same category of empirically-chosen heuristic as
+  // the top1Share thresholds above -- 5000 is comfortably above the ~500-1000 range where the realistic
+  // (non-unit-valued) uniform workload still showed false-positive shrinkage, and well under a shard's
+  // typical total sample volume so the skewed case still has room to trigger.
+  private static final long MIN_SAMPLES_BEFORE_ADAPTATION = 5000;
 
   private final int _numShards;
   private final boolean _adaptiveCapacity;
@@ -121,7 +132,9 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
       _runningMax[shard] = updatedValue;
     }
     if (_sampleCount[shard] < MIN_SAMPLES_BEFORE_ADAPTATION) {
-      return; // not enough evidence yet -- top1Share is noise-dominated at very low sample counts
+      // Too few samples yet -- top1Share is noise-dominated (a lucky early high-value draw, or a key
+      // that happened to repeat a couple of times first) rather than a real concentration signal.
+      return;
     }
     double top1Share = _runningMax[shard] / _runningTotal[shard];
     int targetTier = top1Share < MEDIUM_TOP1_SHARE_THRESHOLD ? 0

@@ -584,21 +584,58 @@ largest individual draw seen so far," not a real signal. Fixed by adding an expl
 **The fix helped substantially but left a smaller residual issue**, also only visible with
 non-unit values: post-fix, the same uniform workload now holds ~36,500 of the true 50,000
 keys (down from the 3200 floor, but still ~27% lower than it should be, since uniform data
-should trigger no shrinkage). Likely cause: `MIN_SAMPLES_BEFORE_ADAPTATION=500` (now correctly
-counting upserts) is still small relative to a shard's own local key cardinality (~781 keys
-in this workload) -- after 500 draws spread across ~781 possible keys, most keys have been
-seen once or twice at most, so "the max so far" can still be dominated by which key got lucky
-with a couple of high-value draws, not genuine repeated dominance. The gate most likely needs
-to scale with a shard's own observed local cardinality rather than being a flat constant
-across every configuration. **Not yet fixed** — documented honestly as a known, real,
-second-order gap rather than claimed as solved, since the value-added evidence (the fix from
-3200 to 36,500) is real progress but not a complete fix.
+should trigger no shrinkage). Working hypothesis at the time: `MIN_SAMPLES_BEFORE_ADAPTATION=500`
+(now correctly counting upserts) is still small relative to a shard's own local key
+cardinality (~781 keys in this workload) — after 500 draws spread across ~781 possible keys,
+most keys have been seen once or twice at most, so "the max so far" can still be dominated by
+which key got lucky with a couple of high-value draws, not genuine repeated dominance.
+
+**First attempt at that hypothesis made things worse, not better.** The gate was changed to
+scale with the shard's own observed distinct-key count —
+`requiredSamples = max(100, 10 * shard.size())` — which did fully resolve the uniform-workload
+false positive (`totalHeld=50000` exactly, matching true cardinality in all trials). But
+rerunning `VerifyAdaptiveDirectionC.java` (the skew/cardinality sweep that had never been
+re-checked after this change) showed the fix had broken the actually-important case: at
+skew=1.0 the aggregate memory reduction dropped to 1.5-9% (vs. Direction A's 96-98% with the
+same signal/thresholds), and — backwards from what's needed — it got *worse* as cardinality
+grew from 320K to 20M. Root cause: `NUM_THREADS x RECORDS_PER_THREAD / NUM_SHARDS` fixes the
+*available* sample budget per shard at ~15,625 regardless of cardinality, but a Zipfian
+distribution's long tail keeps adding *distinct* keys as cardinality grows even though its
+*head* (the only thing `top1Share` depends on) stabilizes almost immediately — so
+`shard.size()` was the wrong quantity to scale against: it conflates "tail is long" with
+"signal is unreliable," and required-samples kept climbing past the available budget for most
+shards, especially at higher cardinality. This was caught by the same discipline as every
+other fix in this document — rerun the previously-good case after changing anything, not just
+the case that motivated the change — and is recorded here rather than silently discarded,
+since it's a real, structural reason to avoid this class of fix in the future, not just a bad
+parameter choice.
+
+**Final fix: reverted to a flat sample count, retuned.** `MIN_SAMPLES_BEFORE_ADAPTATION` went
+from `500` to `5000` — same shape as the original (pre-bug) design, just a bigger constant,
+chosen empirically the same way the `top1Share` tier thresholds already were. Verified against
+both regimes together, in the same session, before considering this closed:
+- Uniform/realistic-value workload (`CompareShardedOffHeapVsDirectionA.java`): `totalHeld=50000`
+  exactly, matching true cardinality in all 3 trials — the false positive is fully gone, not
+  just reduced.
+- Skew/cardinality sweep (`VerifyAdaptiveDirectionC.java`, real concurrent threads): skew=0.15
+  unchanged (304,482 held either way — correctly no shrinkage), skew=0.5 shows real reduction
+  (286,603 -> 134,940, ~53%), skew=1.0 collapses to the SMALL floor on every shard
+  (149,358 -> 3,200, ~98%) and **stays exactly at 3,200 from cardinality 320K through 20M** —
+  matching (slightly exceeding) Direction A's own 96-98% number. `recall@10` stayed 100% in
+  every cell of both sweeps.
+
+This is now considered resolved, with one honest caveat carried into §6.6: `5000` is tuned
+against this test's specific sample volume (~15,625/shard), not derived from first principles
+— a workload with a much smaller per-shard sample budget (e.g. far fewer records per query, or
+many more shards) has not been tried and could plausibly need a smaller constant.
 
 ### 6.6 Open questions
 
-- The `MIN_SAMPLES_BEFORE_ADAPTATION` gate needs to scale with local cardinality, not be a
-  flat constant (§6.5) — the most concrete unresolved item, with a clear reproduction case
-  (`CompareShardedOffHeapVsDirectionA.java`'s uniform-random-value workload).
+- The adaptive-capacity gate (§6.5) is a flat, empirically-chosen sample-count constant
+  (`MIN_SAMPLES_BEFORE_ADAPTATION=5000`), verified against both a uniform/realistic-value
+  workload and a skew/cardinality sweep together — not yet verified against a workload with a
+  much smaller per-shard sample volume than the ~15,625 both existing tests happen to share
+  (see §6.5's closing caveat).
 - Only a first-pass performance comparison (§6.4) — not yet JMH-rigor, not yet varied across
   skew/cardinality the way Direction A and B were individually.
 - The write-lock-for-every-upsert simplification (§6.2) is untested against a more
@@ -618,7 +655,7 @@ characterized on real implementations across the same three axes:
 | | A: sharding + adaptive capacity | B: per-thread + off-heap | C: sharding + off-heap |
 |---|---|---|---|
 | Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | ~1.7-2.1x faster + ~0 GC vs. Direction A itself (§6.4, first-pass) |
-| Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) — clean on the all-`1.0`-value workload (mirrors A's numbers), real bug found and fixed on a realistic non-unit-value workload, with a known remaining gate-tuning gap |
+| Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
 | Correctness risk | None found (§4.5) | Real: recall@10 drops to 62-92% at mild skew (§5.7), unmitigated | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3) |
 | Wired into query engine | No (§4.6) | No (§5.8) | No (§6.6) |
 | Regression tests | No (§4.6) | No (§5.8) | No (§6.6) |
@@ -626,18 +663,19 @@ characterized on real implementations across the same three axes:
 **Direction C currently looks like the strongest candidate**: it inherits Direction A's
 correctness guarantee exactly (confirmed, not just argued by analogy — §6.3), its first
 performance comparison beat Direction A outright rather than merely matching it, and it now
-has Direction A's adaptive-capacity idea ported for the memory-ceiling problem (§4.2) — not
-yet as polished as Direction A's (a real gate-tuning bug was found and partially, not fully,
-fixed — §6.5), but the core mechanism transfers and the remaining gap is understood and
-narrow, not a fundamental blocker. Performance numbers are still first-pass, not JMH-rigor
-(§6.4's caveats). Direction B's standalone results remain useful as the underlying evidence
-that off-heap storage genuinely lowers GC pressure and that duplication does not erase that
-benefit (§5.5-§5.6) — but as a complete design, Direction B carries a correctness risk that
-Direction C does not, for what was (in this comparison) *better* performance, not worse —
-which weakens the case for choosing plain Direction B over Direction C specifically. Next
-step is Jackie's input on which direction(s) to keep pursuing — most plausibly Direction C,
-with the adaptive-capacity gate fix (§6.6) and JMH-rigor benchmarking as the concrete
-remaining work before it's ready to compare against Direction A on fully equal footing.
+has Direction A's adaptive-capacity idea ported for the memory-ceiling problem (§4.2) with
+memory numbers matching Direction A's own (§6.5) — two real gate-tuning bugs were found and
+fixed along the way, both verified against a uniform and a skewed workload together, not just
+whichever one motivated the fix. Performance numbers are still first-pass, not JMH-rigor
+(§6.4's caveats), and the gate constant's tuning is itself scoped to the sample volume both
+existing tests happen to share (§6.5/§6.6). Direction B's standalone results remain useful as
+the underlying evidence that off-heap storage genuinely lowers GC pressure and that
+duplication does not erase that benefit (§5.5-§5.6) — but as a complete design, Direction B
+carries a correctness risk that Direction C does not, for what was (in this comparison)
+*better* performance, not worse — which weakens the case for choosing plain Direction B over
+Direction C specifically. Next step is Jackie's input on which direction(s) to keep pursuing —
+most plausibly Direction C, with JMH-rigor benchmarking as the concrete remaining work before
+it's ready to compare against Direction A on fully equal footing.
 
 ## 8. A note on benchmark rigor
 
