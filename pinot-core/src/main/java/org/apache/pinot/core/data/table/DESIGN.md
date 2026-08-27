@@ -417,10 +417,49 @@ independently re-confirmed unchanged by this fix (1.11x–6.05x vs. the earlier
 1.12x–6.07x — same numbers within run-to-run noise), as expected: fixing the trim
 implementation's speed doesn't change which keys the trim selects.
 
-### 5.7 Open questions
+### 5.7 Correctness risk, measured on this prototype
 
-- The correctness risk from local pre-merge trimming (§5.2) is still entirely unaddressed by
-  this prototype — now the single largest remaining gap for Direction B.
+`CorrectnessRiskOffHeap.java`: same multi-thread-Zipfian setup as §5.5/§5.6 (10 threads,
+50,000 upserts each, cardinality 20,000), but now measuring recall@10 instead of duplication
+or GC. Ground truth is each key's TRUE total value, summed across every thread's contribution
+regardless of trim; the "reported" result merges each thread's `OffHeapGroupTable` only
+*after* it locally trims to `TRIM_CAPACITY` (matching `finish()` semantics), summing values
+for any key that happens to survive in more than one thread. Swept across skew and three trim
+capacities, 5 trials each (avg recall@10, %):
+
+| Skew | capacity=500 | capacity=100 | capacity=20 |
+|---|---|---|---|
+| 0.15 | 92 | 80 | 62 |
+| 0.30 | 100 | 96 | 96 |
+| 0.50 | 100 | 100 | 100 |
+| 0.80 | 100 | 100 | 100 |
+| 1.00 | 100 | 100 | 100 |
+
+**The risk is real and reproduces through the real `OffHeapGroupTable`/`trimTo()` path, not
+just as an abstract architectural concern.** The pattern matches Direction A's
+`ShardSizeCalibration` finding exactly: risk concentrates in the mild-skew band (0.15,
+mildly at 0.30) and gets monotonically worse as trim capacity shrinks (92% → 80% → 62% at
+skew 0.15); skew >= 0.5 is robust at 100% recall even at the most aggressive capacity tested
+(20) — this is the same architectural property surfacing in a different implementation, as
+expected, since off-heap storage does not touch trim *logic*, only trim *cost* (§5.2). The
+absolute recall numbers here are milder than the most severe cases previously found for the
+on-heap "simple" design (which used different parameters, from a different session) — as
+with the duplication-factor magnitude (§5.5), this is parameter-dependent and should not be
+assumed to transfer; what's robust is the *shape* (mild-skew risk band, monotonic in
+capacity), independently reproduced here.
+
+**Practical implication for Direction B**: whatever trim capacity a real deployment would use
+per thread matters a great deal for how much correctness risk is being accepted, exactly as
+it did for Direction A before adaptive capacity was introduced to manage it (§4.2-§4.3). This
+prototype has no analogous mitigation — Direction A's `top1Share` adaptive-capacity mechanism
+could in principle be ported to a per-thread off-heap table the same way it was added to a
+sharded one, but that has not been attempted.
+
+### 5.8 Open questions
+
+- No mitigation for the correctness risk exists in this prototype (see above) — porting
+  something like Direction A's adaptive capacity signal to a per-thread table is a plausible
+  next step, unexplored.
 - Prototype is not integrated with real `QueryContext`/`DataSchema`/multi-column keys, and is
   not wired into the query engine.
 - No regression test suite — current verification is scratch scripts only, same caveat as
@@ -428,24 +467,29 @@ implementation's speed doesn't change which keys the trim selects.
 
 ## 6. Open decision
 
-No decision has been made between Direction A (sharding + adaptive capacity, fully
-implemented and verified against real classes, not yet wired into the query engine or
-regression-tested) and Direction B (per-thread + off-heap). Direction B's performance case
-(Jackie's stated GC-pressure rationale) is now on solid empirical footing: ~19–22% faster
-wall-clock and 82–91% less GC time than on-heap, holding at both a ~1.1x and a ~6x
-duplication factor (§5.6) — duplication does not erase the benefit. Getting here required
-fixing a real bug in the prototype itself (a naive quicksort that degraded catastrophically
-on this workload's duplicate-heavy values, §5.6), which is its own small illustration of the
-gap between "the idea is sound" and "the implementation is correct and fast." What remains
-unresolved is not performance but **correctness**: the risk inherited from the "simple"
-per-thread architecture (§5.2) — a key's true importance may only be known after merging all
-threads' partial views, so trimming locally can silently drop one — is completely untouched
-by any of Direction B's measurements so far, and is a property Direction A was specifically
-built to avoid. A fast, GC-light design that is also silently wrong at mild skew is not yet a
-finished comparison against Direction A. The two directions are not mutually exclusive in
-principle (§5.3). Next step is Jackie's input on which to pursue, or whether to measure
-Direction B's correctness-under-merge behavior before comparing it against Direction A on
-equal footing.
+No decision has been made between Direction A (sharding + adaptive capacity) and Direction B
+(per-thread + off-heap) — both are now characterized in comparable depth, on real
+implementations, across the same three axes (performance, memory, correctness):
+
+| | Direction A (sharding + adaptive capacity) | Direction B (per-thread + off-heap) |
+|---|---|---|
+| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) |
+| Memory | Real, tunable via `top1Share` signal: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5); off-heap makes each duplicate cheaper but does not reduce the factor |
+| Correctness risk | None found — adaptive capacity never underperforms fixed full capacity (§4.5) | Real, reproduced: recall@10 drops to 62-92% at mild skew depending on trim capacity (§5.7), same root cause and shape as the original "simple" design, unmitigated in this prototype |
+| Wired into query engine | No (§4.6) | No (§5.8) |
+| Regression tests | No (§4.6) | No (§5.8) |
+
+Direction A currently has the more complete safety story: its one known correctness-adjacent
+property (the memory ceiling) has a working, measured mitigation (adaptive capacity), and no
+recall regression was found in any tested configuration. Direction B's performance case
+(Jackie's stated GC-pressure rationale) is now solid and duplication-robust, but its
+correctness risk — inherited from the on-heap "simple" design this architecture already
+shares — has no analogous mitigation yet; §5.7 suggests porting Direction A's `top1Share`
+idea to a per-thread table as a plausible next step, but that is unexplored. The two
+directions are not mutually exclusive in principle (§5.3) — a combined design (per-thread,
+off-heap, *and* adaptive-capacity-style mitigation of the local-trim risk) is conceivable but
+not attempted. Next step is Jackie's input on which to pursue, or whether to close Direction
+B's correctness gap before treating the two as comparable.
 
 ## 7. A note on benchmark rigor
 
