@@ -88,25 +88,23 @@ public class OffHeapGroupTable implements AutoCloseable {
     if (_size <= topK) {
       return;
     }
-    int[] order = new int[_size];
+    // Sort descending by value with zero boxing: java.util.Arrays.sort only accepts a Comparator for
+    // Object[], not double[]/int[], so a naive fix would box into Double[]/Integer[] -- which just moves
+    // the per-entry allocation cost this design is trying to avoid from upsert() into trimTo(). Instead,
+    // extract into two parallel primitive arrays and sort both together with a hand-rolled quicksort.
+    double[] values = new double[_size];
+    int[] indices = new int[_size];
     for (int i = 0; i < _size; i++) {
-      order[i] = i;
+      values[i] = _segment.get(ValueLayout.JAVA_DOUBLE, (long) i * RECORD_SIZE + VALUE_OFFSET);
+      indices[i] = i;
     }
-    Double[] boxedForSort = new Double[_size]; // small, short-lived boxing just for the comparator; not the
-    // steady-state per-entry storage this design is trying to avoid
-    for (int i = 0; i < _size; i++) {
-      boxedForSort[i] = _segment.get(ValueLayout.JAVA_DOUBLE, i * RECORD_SIZE + VALUE_OFFSET);
-    }
-    Integer[] boxedOrder = new Integer[_size];
-    for (int i = 0; i < _size; i++) {
-      boxedOrder[i] = i;
-    }
-    Arrays.sort(boxedOrder, (a, b) -> Double.compare(boxedForSort[b], boxedForSort[a]));
+    quickSortDescending(values, indices, 0, _size - 1);
 
     MemorySegment trimmedSegment = _arena.allocate(RECORD_SIZE * topK, 8);
     for (int newSlot = 0; newSlot < topK; newSlot++) {
-      int oldSlot = boxedOrder[newSlot];
-      MemorySegment.copy(_segment, oldSlot * RECORD_SIZE, trimmedSegment, newSlot * RECORD_SIZE, RECORD_SIZE);
+      int oldSlot = indices[newSlot];
+      MemorySegment.copy(_segment, (long) oldSlot * RECORD_SIZE, trimmedSegment, (long) newSlot * RECORD_SIZE,
+          RECORD_SIZE);
     }
     _segment = trimmedSegment;
     _dataCapacity = topK;
@@ -197,5 +195,82 @@ public class OffHeapGroupTable implements AutoCloseable {
       p <<= 1;
     }
     return p;
+  }
+
+  // ---------- zero-boxing dual-array quicksort (descending by `values`, `indices` carried along) ----------
+
+  private static final int INSERTION_SORT_CUTOFF = 16;
+
+  /// 3-way (Dutch national flag) partitioning quicksort. A naive 2-way partition degrades to O(n^2) when
+  /// many elements are equal -- exactly the shape of this data (upsert(key, 1.0)-accumulated integer-ish
+  /// counts collide constantly, e.g. many keys landing on count=2, count=3, ...). A first version of this
+  /// method used 2-way partitioning and was measured to be catastrophically slower than the boxed
+  /// Arrays.sort() it replaced (2117ms vs 286ms in one comparison) specifically because of this. 3-way
+  /// partitioning groups all values equal to the pivot into a single pass with no further recursion needed
+  /// on them, which is the standard fix for duplicate-heavy inputs.
+  private static void quickSortDescending(double[] values, int[] indices, int lo, int hi) {
+    while (lo < hi) {
+      if (hi - lo < INSERTION_SORT_CUTOFF) {
+        insertionSortDescending(values, indices, lo, hi);
+        return;
+      }
+      int mid = lo + (hi - lo) / 2;
+      if (values[mid] > values[lo]) {
+        swap(values, indices, lo, mid);
+      }
+      if (values[hi] > values[lo]) {
+        swap(values, indices, lo, hi);
+      }
+      if (values[mid] > values[hi]) {
+        swap(values, indices, mid, hi);
+      }
+      double pivot = values[hi]; // median-of-three now sits at hi
+
+      int lt = lo; // [lo, lt-1]: values > pivot
+      int i = lo;  // [lt, i-1]: values == pivot (scanned so far)
+      int gt = hi; // [gt+1, hi]: values < pivot
+      while (i <= gt) {
+        if (values[i] > pivot) { // descending: larger values partition to the left
+          swap(values, indices, lt++, i++);
+        } else if (values[i] < pivot) {
+          swap(values, indices, i, gt--);
+        } else {
+          i++;
+        }
+      }
+      // [lt, gt] all equal pivot -- correctly placed already, no need to recurse into it.
+
+      if (lt - lo < hi - gt) {
+        quickSortDescending(values, indices, lo, lt - 1);
+        lo = gt + 1;
+      } else {
+        quickSortDescending(values, indices, gt + 1, hi);
+        hi = lt - 1;
+      }
+    }
+  }
+
+  private static void insertionSortDescending(double[] values, int[] indices, int lo, int hi) {
+    for (int i = lo + 1; i <= hi; i++) {
+      double v = values[i];
+      int idx = indices[i];
+      int j = i - 1;
+      while (j >= lo && values[j] < v) {
+        values[j + 1] = values[j];
+        indices[j + 1] = indices[j];
+        j--;
+      }
+      values[j + 1] = v;
+      indices[j + 1] = idx;
+    }
+  }
+
+  private static void swap(double[] values, int[] indices, int i, int j) {
+    double tv = values[i];
+    values[i] = values[j];
+    values[j] = tv;
+    int ti = indices[i];
+    indices[i] = indices[j];
+    indices[j] = ti;
   }
 }

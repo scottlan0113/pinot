@@ -384,22 +384,43 @@ low- and high-duplication extreme — duplication does not erase this benefit, s
 implementations pay the identical duplication factor and off-heap still wins. This is the
 core claim from §5.4 holding up under a more realistic workload.
 
-**Wall-clock advantage is NOT robust once trimming is included**: off-heap is a wash-to-worse
-at skew 0.0 (286 vs 283 ms) and only modestly better at skew 1.0 (165 vs 173 ms) — unlike
-§5.4's untrimmed workload, where off-heap was ~38–40% faster outright. Likely cause: this
-prototype's current `trimTo()` sorts by boxing into `Double[]`/`Integer[]` internally (see
-the implementation), which reintroduces exactly the kind of per-entry allocation cost this
-design is meant to avoid, just during the trim step instead of the upsert step. This looks
-like a fixable implementation inefficiency (sort via a primitive index array instead of
-boxing) rather than a fundamental limit of the off-heap approach — but it has not been fixed
-or re-measured yet, so the wall-clock claim should not be overstated pending that fix.
+**Wall-clock advantage was NOT robust once trimming was included, in the first version of
+this prototype** — off-heap was a wash-to-worse at skew 0.0 (286 vs 283 ms) and only
+modestly better at skew 1.0 (165 vs 173 ms), unlike §5.4's untrimmed workload where off-heap
+was ~38–40% faster outright. Root cause: `trimTo()` originally sorted by boxing into
+`Double[]`/`Integer[]` (`java.util.Arrays.sort` only accepts a `Comparator` for `Object[]`,
+not `double[]`/`int[]`), reintroducing exactly the per-entry allocation cost this design is
+meant to avoid, just during the trim step instead of the upsert step.
+
+**Fixed**: replaced the boxed sort with a hand-rolled, zero-boxing quicksort operating on two
+parallel primitive arrays (`double[] values`, `int[] indices`), sorted together. First fix
+attempt used a standard 2-way (Lomuto-style) partition and was measured to be
+**catastrophically slower** — 2117 ms vs the original 286 ms at skew 0.0 — because this
+workload's values are `upsert(key, 1.0)`-accumulated small-integer-ish counts with heavy
+duplication (many keys landing on the same count), which degrades a naive 2-way partition
+toward O(n^2): when many elements equal the pivot, only one element gets excluded per
+partitioning pass. Fixed properly with 3-way (Dutch national flag) partitioning, which groups
+all pivot-equal elements into a single pass with no further recursion needed on them — the
+standard remedy for duplicate-heavy inputs. Re-measured after the real fix, reproduced across
+2 runs:
+
+| Skew | Impl | Wall-clock | GC time |
+|---|---|---|---|
+| 0.0 | on-heap | 270–279 ms | 11–21 ms |
+| 0.0 | off-heap | 217–220 ms | 2–3 ms |
+| 1.0 | on-heap | 167 ms | 9–11 ms |
+| 1.0 | off-heap | 134–135 ms | 1 ms |
+
+Both wall-clock (~19–22% faster) and GC time (~82–91% less) now favor off-heap at both
+duplication extremes, consistently across both runs. Duplication factor itself (§5.5) was
+independently re-confirmed unchanged by this fix (1.11x–6.05x vs. the earlier
+1.12x–6.07x — same numbers within run-to-run noise), as expected: fixing the trim
+implementation's speed doesn't change which keys the trim selects.
 
 ### 5.7 Open questions
 
-- Fix `trimTo()`'s boxing and re-measure wall-clock under duplication (§5.6) before claiming
-  a wall-clock win, not just a GC-time win.
 - The correctness risk from local pre-merge trimming (§5.2) is still entirely unaddressed by
-  this prototype.
+  this prototype — now the single largest remaining gap for Direction B.
 - Prototype is not integrated with real `QueryContext`/`DataSchema`/multi-column keys, and is
   not wired into the query engine.
 - No regression test suite — current verification is scratch scripts only, same caveat as
@@ -409,19 +430,22 @@ or re-measured yet, so the wall-clock claim should not be overstated pending tha
 
 No decision has been made between Direction A (sharding + adaptive capacity, fully
 implemented and verified against real classes, not yet wired into the query engine or
-regression-tested) and Direction B (per-thread + off-heap). Direction B's GC-pressure benefit
-(Jackie's stated rationale) holds up well: 81–93% less GC time than on-heap, confirmed robust
-to duplication (measured at both a 1.12x and a 6.07x duplication factor, §5.6) — this part of
-the proposal is on solid empirical footing. Two things are not yet resolved: (1) the
-wall-clock picture is mixed once a realistic trim step is included, likely fixable (§5.6);
-(2) the correctness risk inherited from the "simple" per-thread architecture (§5.2) is
-untouched by any of this and remains the largest unresolved question for Direction B — a
-low GC/memory cost does not help if the design still silently drops keys pre-merge at mild
-skew, which is a correctness property Direction A was specifically built to avoid. The two
-directions are not mutually exclusive in principle (§5.3). Next step is Jackie's input on
-which to pursue, or whether to close Direction B's remaining gaps (trim-boxing fix,
-correctness-under-merge measurement) before comparing it against Direction A on equal
-footing.
+regression-tested) and Direction B (per-thread + off-heap). Direction B's performance case
+(Jackie's stated GC-pressure rationale) is now on solid empirical footing: ~19–22% faster
+wall-clock and 82–91% less GC time than on-heap, holding at both a ~1.1x and a ~6x
+duplication factor (§5.6) — duplication does not erase the benefit. Getting here required
+fixing a real bug in the prototype itself (a naive quicksort that degraded catastrophically
+on this workload's duplicate-heavy values, §5.6), which is its own small illustration of the
+gap between "the idea is sound" and "the implementation is correct and fast." What remains
+unresolved is not performance but **correctness**: the risk inherited from the "simple"
+per-thread architecture (§5.2) — a key's true importance may only be known after merging all
+threads' partial views, so trimming locally can silently drop one — is completely untouched
+by any of Direction B's measurements so far, and is a property Direction A was specifically
+built to avoid. A fast, GC-light design that is also silently wrong at mild skew is not yet a
+finished comparison against Direction A. The two directions are not mutually exclusive in
+principle (§5.3). Next step is Jackie's input on which to pursue, or whether to measure
+Direction B's correctness-under-merge behavior before comparing it against Direction A on
+equal footing.
 
 ## 7. A note on benchmark rigor
 
