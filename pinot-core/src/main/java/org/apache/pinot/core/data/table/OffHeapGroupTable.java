@@ -77,14 +77,17 @@ public class OffHeapGroupTable implements AutoCloseable {
   }
 
   /// Upsert: adds `value` to the running aggregate for `key` (SUM semantics), inserting a new record if
-  /// `key` has not been seen before.
-  public void upsert(int key, double value) {
+  /// `key` has not been seen before. Returns the key's new aggregated value post-upsert -- callers that
+  /// want to track a concentration signal (e.g. adaptive capacity, see ShardedOffHeapGroupTable) need
+  /// this and would otherwise have to do a second, redundant lookup for it.
+  public double upsert(int key, double value) {
     int probe = indexOf(key);
     if (probe >= 0) {
       int slot = _indexSlots[probe];
       double existing = _segment.get(ValueLayout.JAVA_DOUBLE, slot * RECORD_SIZE + VALUE_OFFSET);
-      _segment.set(ValueLayout.JAVA_DOUBLE, slot * RECORD_SIZE + VALUE_OFFSET, existing + value);
-      return;
+      double updated = existing + value;
+      _segment.set(ValueLayout.JAVA_DOUBLE, slot * RECORD_SIZE + VALUE_OFFSET, updated);
+      return updated;
     }
 
     if (_size >= _dataCapacity) {
@@ -98,6 +101,7 @@ public class OffHeapGroupTable implements AutoCloseable {
       growIndex();
     }
     insertIntoIndex(key, slot);
+    return value;
   }
 
   /// Trims down to the top `topK` records by value (descending), discarding the rest. Mirrors
