@@ -20,10 +20,10 @@
 -->
 # GROUP BY Combine-Level Memory & Performance — Design Document
 
-Status: **investigation / candidate designs — not finalized.** Two candidate directions are
-described below (§4, §5); no decision has been made between them, and neither is proposed
-for merge as-is. This document exists to record findings before they are lost, per Jackie's
-request, ahead of converging on one design.
+Status: **investigation / candidate designs — not finalized.** Three candidate directions are
+described below (§4, §5, §6 — the third combines the first two); no decision has been made
+between them, and none is proposed for merge as-is. This document exists to record findings
+before they are lost, per Jackie's request, ahead of converging on one design.
 
 Tracked issues: [apache/pinot#10498](https://github.com/apache/pinot/issues/10498),
 [apache/pinot#11924](https://github.com/apache/pinot/issues/11924) ("GROUP BY Optimizations").
@@ -58,7 +58,7 @@ Two related concerns motivate this investigation:
   contention) vs. high cardinality (rising per-group overhead). An initial benchmark run
   using the existing `BenchmarkIndexedTable` concluded "no evidence lock is the bottleneck"
   in either case — **this conclusion was later found to be wrong**, caused by an unrigorous
-  benchmark (see §7, and the fix in #19368: a shared `java.util.Random` field created false
+  benchmark (see §8, and the fix in #19368: a shared `java.util.Random` field created false
   cross-thread contention, and `NUM_RECORDS` was too close to the key cardinality to exercise
   realistic repeat-hit behavior). Jackie's response proposed two directions: (a) profile to
   find the real bottleneck, and (b) consider an off-heap storage solution (see §5).
@@ -465,33 +465,130 @@ sharded one, but that has not been attempted.
 - No regression test suite — current verification is scratch scripts only, same caveat as
   Direction A (§4.6).
 
-## 6. Open decision
+## 6. Direction C: combining A and B (sharded off-heap)
 
-No decision has been made between Direction A (sharding + adaptive capacity) and Direction B
-(per-thread + off-heap) — both are now characterized in comparable depth, on real
-implementations, across the same three axes (performance, memory, correctness):
+Prompted by the user asking, after §4/§5 were both characterized, whether the two directions
+could simply be combined rather than chosen between.
 
-| | Direction A (sharding + adaptive capacity) | Direction B (per-thread + off-heap) |
+### 6.1 Why "just combine them" is not trivial
+
+Direction A's correctness guarantee depends on routing by **key hash** (§4.1): a key always
+lands on the same shard regardless of which thread produced it, so no shard ever has an
+incomplete view. Direction B's off-heap tractability depends on routing by **thread** (§5.1):
+each table is touched by exactly one thread, so `Arena.ofConfined()` can enforce
+single-thread access at the JVM level with no concurrency control needed at all. These two
+routing schemes are in direct tension — switching from thread-routing to key-hash-routing
+means a single shard can now be written by *multiple* threads concurrently, which is exactly
+the "shared off-heap structure" problem `Arena.ofConfined()` was used to avoid needing to
+solve.
+
+### 6.2 Design: shard by key hash, off-heap storage per shard, lock per shard
+
+`ShardedOffHeapGroupTable`
+(`pinot-core/src/main/java/org/apache/pinot/core/data/table/OffHeapGroupTable.java`'s new
+`(capacity, Arena)` constructor + `ShardedOffHeapGroupTable.java`): `numShards` shards, each
+an `OffHeapGroupTable`, all sharing one `Arena.ofShared()` (not `ofConfined()` — a shared
+arena permits access from any thread, since JVM-level single-thread enforcement is no longer
+available once multiple threads must reach the same shard) with one lifecycle (`close()`
+frees every shard's memory together). Routing mirrors Direction A exactly:
+`Math.floorMod(Integer.hashCode(key), numShards)`. Each shard is additionally guarded by its
+own `ReentrantReadWriteLock` — this is *not* optional the way `ConcurrentIndexedTable`'s read
+lock is for the common case: `OffHeapGroupTable` has no internal concurrency control
+analogous to `ConcurrentHashMap`, so every `upsert()` takes the shard's **write** lock for its
+full duration, not just resize/trim. This is a real, deliberate simplification for a first
+prototype — more serialization per shard than Direction A's `ConcurrentHashMap`-backed shards
+have — flagged as something to measure, not assume away.
+
+`OffHeapGroupTable` itself gained a second constructor,
+`OffHeapGroupTable(int initialCapacity, Arena arena)`, taking an externally-owned arena
+instead of creating its own confined one; an instance built this way does not close the arena
+in its own `close()` (the owner — here, `ShardedOffHeapGroupTable` — closes it once, after
+every shard is done). The original single-arg constructor (own confined arena, owns its own
+lifecycle) is unchanged, so every existing Direction B usage/test still works as before.
+
+### 6.3 Correctness: real concurrent threads, not simulation
+
+Every Direction B measurement (§5) used *simulated* per-thread tables — one thread at a time,
+sequentially, standing in for "a thread" — because a single `OffHeapGroupTable` was never
+meant to be touched by more than one thread, so there was nothing concurrent to test. This
+design's entire point is genuine concurrent access to shared shards, so it needed a different
+kind of test: `ShardedOffHeapCorrectnessTest.java` runs `NUM_THREADS=10` real threads (via
+`ExecutorService`) concurrently upserting 100,000 records each (cardinality 50,000) into one
+shared `ShardedOffHeapGroupTable`, cross-checked against a `ConcurrentHashMap`-based ground
+truth fed the identical stream. Passed cleanly across 4 runs (1 + 3 repeats, since
+concurrency bugs are often non-deterministic and a single clean pass does not rule one out):
+every one of 50,000 distinct keys' aggregated value matched ground truth exactly, with no
+size mismatch. This is Direction A's zero-correctness-risk property (§4.1), now confirmed to
+carry over to the off-heap-backed version — expected, since the same key-hash routing
+argument applies regardless of where a shard's bytes live, but confirmed rather than assumed.
+
+### 6.4 Performance vs. Direction A
+
+`CompareShardedOffHeapVsDirectionA.java`: same workload against both the real
+`ShardedIndexedTable` (Direction A, on-heap, `ConcurrentHashMap` per shard) and
+`ShardedOffHeapGroupTable` (this section) — 10 real threads, 100,000 upserts each,
+cardinality 50,000, 64 shards, trim size 5,000. Measured via `GarbageCollectorMXBean`,
+`-Xmx512m`, post-warmup, 3 trials per run, reproduced across 2 full runs:
+
+| | Wall-clock (avg of 3) | GC time (avg of 3) |
 |---|---|---|
-| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) |
-| Memory | Real, tunable via `top1Share` signal: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5); off-heap makes each duplicate cheaper but does not reduce the factor |
-| Correctness risk | None found — adaptive capacity never underperforms fixed full capacity (§4.5) | Real, reproduced: recall@10 drops to 62-92% at mild skew depending on trim capacity (§5.7), same root cause and shape as the original "simple" design, unmitigated in this prototype |
-| Wired into query engine | No (§4.6) | No (§5.8) |
-| Regression tests | No (§4.6) | No (§5.8) |
+| Direction A (on-heap sharded) | 79 ms | 5.3 ms |
+| Direction C (sharded off-heap) | 38–46 ms | ~0.0 ms |
 
-Direction A currently has the more complete safety story: its one known correctness-adjacent
-property (the memory ceiling) has a working, measured mitigation (adaptive capacity), and no
-recall regression was found in any tested configuration. Direction B's performance case
-(Jackie's stated GC-pressure rationale) is now solid and duplication-robust, but its
-correctness risk — inherited from the on-heap "simple" design this architecture already
-shares — has no analogous mitigation yet; §5.7 suggests porting Direction A's `top1Share`
-idea to a per-thread table as a plausible next step, but that is unexplored. The two
-directions are not mutually exclusive in principle (§5.3) — a combined design (per-thread,
-off-heap, *and* adaptive-capacity-style mitigation of the local-trim risk) is conceivable but
-not attempted. Next step is Jackie's input on which to pursue, or whether to close Direction
-B's correctness gap before treating the two as comparable.
+Direction C was faster (~1.7–2.1x) and had essentially zero GC time in both full runs,
+despite the write-lock-per-upsert simplification (§6.2) that was flagged as a possible
+regression risk — it was not one in this test. **Caveat**: this comparison uses
+`ShardedOffHeapGroupTable`'s simplified API (raw `int`/`double`, no `Record`/`Key` boxing at
+the call site) against Direction A's real `Record`-based API, which requires that boxing —
+some of the gap may be attributable to API/scope simplification (§5.1's single-INT-key,
+single-DOUBLE-aggregate scope, same caveat as everywhere else in Direction B) rather than
+purely to storage location. This is a promising first signal, not a settled verdict — it
+should be re-verified with more trials and, ideally, a version of Direction A's benchmark
+methodology (JMH, not ad-hoc timing) before being treated as final.
 
-## 7. A note on benchmark rigor
+### 6.5 Open questions
+
+- Only a first-pass comparison (§6.4) — not yet JMH-rigor, not yet varied across skew/
+  cardinality the way Direction A and B were individually.
+- The write-lock-for-every-upsert simplification (§6.2) is untested against a more
+  fine-grained alternative (e.g. a lock-free or read-write-split scheme over the off-heap
+  segment) — unknown how much headroom is being left on the table.
+- Inherits every other open item from both parents: no adaptive-capacity-style memory-ceiling
+  mitigation yet (§4.2's ceiling problem applies here too, unaddressed), not wired into the
+  query engine, no regression test suite.
+- Duplication factor does not apply here (key-hash routing means no key is ever duplicated
+  across shards, same as Direction A) — worth stating explicitly since it's easy to
+  incorrectly assume Direction B's duplication numbers (§5.5) carry over.
+
+## 7. Open decision
+
+No decision has been made among Direction A (sharding + adaptive capacity), Direction B
+(per-thread + off-heap), and Direction C (sharding + off-heap, §6) — all three are now
+characterized on real implementations across the same three axes:
+
+| | A: sharding + adaptive capacity | B: per-thread + off-heap | C: sharding + off-heap |
+|---|---|---|---|
+| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | ~1.7-2.1x faster + ~0 GC vs. Direction A itself (§6.4, first-pass) |
+| Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing, §6.5); ceiling problem (§4.2) applies but has no mitigation ported yet |
+| Correctness risk | None found (§4.5) | Real: recall@10 drops to 62-92% at mild skew (§5.7), unmitigated | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3) |
+| Wired into query engine | No (§4.6) | No (§5.8) | No (§6.5) |
+| Regression tests | No (§4.6) | No (§5.8) | No (§6.5) |
+
+**Direction C currently looks like the strongest candidate**: it inherits Direction A's
+correctness guarantee exactly (confirmed, not just argued by analogy — §6.3), and its first
+performance comparison beat Direction A outright rather than merely matching it. It does not
+yet have Direction A's adaptive-capacity mitigation for the memory-ceiling problem (§4.2) —
+that would need to be ported, unexplored — and its performance numbers are first-pass, not
+JMH-rigor (§6.4's caveats). Direction B's standalone results remain useful as the underlying
+evidence that off-heap storage genuinely lowers GC pressure and that duplication does not
+erase that benefit (§5.5-§5.6) — but as a complete design, Direction B carries a correctness
+risk that Direction C does not, for what was (in this first comparison) *better* performance,
+not worse — which weakens the case for choosing plain Direction B over Direction C
+specifically. Next step is Jackie's input on which direction(s) to keep pursuing — most
+plausibly Direction C plus porting Direction A's adaptive-capacity idea to it, but that
+combination has not itself been built or measured yet.
+
+## 8. A note on benchmark rigor
 
 Both the original "no lock bottleneck" false negative (§2) and this investigation's own
 early sharding-speedup claim were initially measured without JMH's fork/warmup/multi-iteration
@@ -501,7 +598,7 @@ bottleneck; overstated a speedup that later needed re-verification with a proper
 investigation — including for whichever direction is eventually pursued — should be held to
 that same standard before being treated as a finding.
 
-## 8. References
+## 9. References
 
 - [apache/pinot#10498](https://github.com/apache/pinot/issues/10498)
 - [apache/pinot#11924](https://github.com/apache/pinot/issues/11924)
@@ -512,5 +609,7 @@ that same standard before being treated as a finding.
 - `pinot-core/src/main/java/org/apache/pinot/core/data/table/IndexedTable.java`
   (`shrinkTrimSizeAndThreshold` addition supporting Direction A)
 - `pinot-core/src/main/java/org/apache/pinot/core/data/table/OffHeapGroupTable.java`
-  (Direction B initial prototype)
+  (Direction B prototype; also the per-shard storage used by Direction C)
+- `pinot-core/src/main/java/org/apache/pinot/core/data/table/ShardedOffHeapGroupTable.java`
+  (Direction C prototype)
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedIndexedTable.java`

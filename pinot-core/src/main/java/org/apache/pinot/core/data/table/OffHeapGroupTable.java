@@ -35,6 +35,7 @@ public class OffHeapGroupTable implements AutoCloseable {
   private static final double MAX_LOAD_FACTOR = 0.7;
 
   private final Arena _arena;
+  private final boolean _ownsArena;
   private MemorySegment _segment;
   private int _dataCapacity;
   private int _size;
@@ -44,8 +45,26 @@ public class OffHeapGroupTable implements AutoCloseable {
   private int _indexCapacity;
   private int _indexSize;
 
+  /// Single-thread-owned table: creates its own confined Arena (JVM-enforced single-thread access,
+  /// matching the original Direction B proposal) and frees it in close(). Existing behavior, unchanged.
   public OffHeapGroupTable(int initialCapacity) {
-    _arena = Arena.ofConfined();
+    this(initialCapacity, Arena.ofConfined(), true);
+  }
+
+  /// Shard-owned table: uses an externally-provided Arena instead of creating its own, so multiple
+  /// shards (and the threads that access them, under an external lock -- see ShardedOffHeapGroupTable)
+  /// can share one Arena with one lifecycle. Must be Arena.ofShared() (or otherwise safe for the actual
+  /// access pattern), NOT ofConfined() -- a confined arena only permits access from the thread that
+  /// created it, which would throw for every other thread touching a shared shard. close() on an
+  /// instance built this way does NOT close the arena -- the owner (whoever passed it in) is responsible
+  /// for closing it exactly once, after all sharers are done.
+  public OffHeapGroupTable(int initialCapacity, Arena arena) {
+    this(initialCapacity, arena, false);
+  }
+
+  private OffHeapGroupTable(int initialCapacity, Arena arena, boolean ownsArena) {
+    _arena = arena;
+    _ownsArena = ownsArena;
     _dataCapacity = Math.max(16, initialCapacity);
     _segment = _arena.allocate(RECORD_SIZE * _dataCapacity, 8);
     _size = 0;
@@ -133,7 +152,11 @@ public class OffHeapGroupTable implements AutoCloseable {
 
   @Override
   public void close() {
-    _arena.close();
+    if (_ownsArena) {
+      _arena.close();
+    }
+    // else: this table doesn't own the arena (constructed via the (capacity, arena) constructor) -- the
+    // owner is responsible for closing it once, after every table sharing it is done.
   }
 
   // ---------- on-heap open-addressing index (key -> off-heap slot), primitive int[] only ----------
