@@ -233,7 +233,7 @@ keeping full capacity per shard in the first place (§4.2).
 - No regression test suite yet — verification so far is ad-hoc scratch scripts, not
   committed tests. This should exist before proposing a real PR.
 
-## 5. Direction B: per-thread tables + off-heap (proposed, unexplored)
+## 5. Direction B: per-thread tables + off-heap (initial prototype)
 
 ### 5.1 Proposal (Jackie, 2026-08-27)
 
@@ -282,28 +282,82 @@ The two are, in principle, stackable rather than competing: a design could shard
 per-thread tables) *and* store entries off-heap *and* apply adaptive capacity to bound the
 count — each addresses a different cost.
 
-### 5.4 Open questions
+### 5.4 Initial prototype
 
-- Has not been prototyped. No implementation, no benchmark, no correctness measurement yet.
-- What off-heap mechanism to use (`sun.misc.Unsafe` and its long-signaled removal, vs. the
-  modern `java.lang.foreign.MemorySegment`/`Arena` API) is an open choice with real
-  tradeoffs (JDK version support, API maturity, safety).
-- Whether the duplication-factor cost becomes acceptable once off-heap, or whether it still
-  needs to be bounded (e.g. combined with some form of the sharding idea to eliminate
-  duplication rather than merely making it cheaper), is unmeasured.
-- Whether the correctness risk from local pre-merge trimming is acceptable in practice (the
-  earlier "simple" investigation found it negligible at realistic skew >= 0.5, but real and
-  measurable — up to significant recall loss — in a mild-skew band) has not been revisited
-  in combination with this proposal.
+`OffHeapGroupTable`
+(`pinot-core/src/main/java/org/apache/pinot/core/data/table/OffHeapGroupTable.java`) is a
+first, deliberately narrow prototype: single INT group-by key, single DOUBLE SUM-like
+aggregate (same scope as Direction A, for comparability), built on
+`java.lang.foreign.Arena`/`MemorySegment` (the modern JDK 22+ FFM API — chosen over
+`sun.misc.Unsafe`, which is unsupported and has a long-signaled removal path). Each record is
+a fixed-width 16-byte off-heap slot (4-byte key + 8-byte double, naturally aligned); an
+on-heap open-addressing `int[]`-based index (key → slot) provides O(1) average lookup without
+reintroducing per-entry object overhead. `Arena.ofConfined()` is used deliberately: it makes
+the single-thread-only assumption a JVM-enforced invariant (another thread touching this
+table's memory throws), not just a convention. Caller must call `close()` — off-heap memory
+is not garbage collected.
+
+**Correctness** (scratch verification, not yet a committed test): cross-checked against a
+plain `HashMap<Integer, Double>` ground truth over 50,000 random upserts (including negative
+values and heavy key repetition, cardinality 2,000) — every key's final aggregated value
+matched exactly. Table growth (off-heap segment reallocation + index rehashing) and
+trim-to-top-K (sort + compact into a smaller segment) were also verified correct in isolation.
+
+**GC / memory** (scratch verification; the specific claim in Jackie's proposal): compared
+against a plain on-heap `HashMap<Integer, Double>` baseline — not the real `SimpleIndexedTable`,
+to isolate exactly the "many boxed entries in JVM heap" cost this design targets, without
+Pinot-specific overhead (Key/Record wrappers, TableResizer) diluting the comparison; a real
+`SimpleIndexedTable` would carry more per-entry overhead than plain `HashMap`, so this
+comparison is if anything conservative toward the on-heap side. Workload: 10 simulated
+per-thread tables, 200,000 upserts each, cardinality 100,000 (864,732 total entries held,
+identical between both approaches), measured via `GarbageCollectorMXBean`, `-Xmx512m`,
+post-JIT-warmup, repeated twice for stability:
+
+| | wall-clock | GC time | GC count |
+|---|---|---|---|
+| on-heap (`HashMap`) | 119 ms | 37–38 ms | 9 |
+| off-heap (`OffHeapGroupTable`) | 72–74 ms | 1–2 ms | 1–9 (unstable, but always cheap) |
+
+GC time dropped ~95% and was consistent across both runs. GC *count* was not a reliable
+signal (varied 1 vs. 9 between runs), but GC *time* was always far lower for off-heap even
+when counts matched — i.e. the benefit is not fewer collections but much cheaper ones (far
+less live object graph for the collector to trace). Wall-clock time was also lower for
+off-heap in this test (~38–40% faster) — avoiding millions of small allocations (boxed
+`Integer`/`Double`, `HashMap.Node`) has a direct allocation-cost benefit, not only a
+downstream GC-cost benefit. This directly supports Jackie's stated rationale ("这样可以解决
+java GC的问题").
+
+**What this prototype does NOT yet address** — the open questions from §5.2 are unchanged by
+these results, since they test a different axis:
+
+- Duplication factor (same key stored once per thread that observed it) is unmeasured in
+  this prototype — the workload above uses one independent table per simulated thread with no
+  merge step, so it does not exercise or quantify duplication at all.
+- The correctness risk from trimming a thread's partial view before merging (a key's true
+  importance may only be known after merging) is unaddressed by design — this prototype has
+  no merge or trim-before-merge logic exercised yet beyond the isolated `trimTo()` unit check.
+
+### 5.5 Open questions
+
+- Duplication-factor and correctness-risk impact, in combination with off-heap storage, are
+  still unmeasured (see above) — this is the most important remaining gap before this
+  direction can be compared on equal footing with Direction A.
+- Prototype is not integrated with real `QueryContext`/`DataSchema`/multi-column keys, and is
+  not wired into the query engine.
+- No regression test suite — current verification is scratch scripts only, same caveat as
+  Direction A (§4.6).
 
 ## 6. Open decision
 
 No decision has been made between Direction A (sharding + adaptive capacity, fully
 implemented and verified against real classes, not yet wired into the query engine or
-regression-tested) and Direction B (per-thread + off-heap, proposed, entirely unexplored).
-The two are not mutually exclusive in principle (§5.3). Next step is Jackie's input on which
-to pursue, or whether to prototype Direction B far enough to compare it against Direction A's
-already-measured numbers before deciding.
+regression-tested) and Direction B (per-thread + off-heap; initial prototype now confirms
+Jackie's GC-pressure rationale — ~95% less GC time, also faster wall-clock, in an isolated
+comparison — but has not yet measured the duplication-factor or correctness-risk costs the
+underlying per-thread architecture is already known to carry). The two are not mutually
+exclusive in principle (§5.3). Next step is Jackie's input on which to pursue — or whether to
+extend Direction B's prototype to measure duplication/correctness under merge before
+comparing it against Direction A's already-measured numbers on equal footing.
 
 ## 7. A note on benchmark rigor
 
@@ -325,4 +379,6 @@ that same standard before being treated as a finding.
   (Direction A prototype, includes `AdaptiveConcurrentIndexedTable`)
 - `pinot-core/src/main/java/org/apache/pinot/core/data/table/IndexedTable.java`
   (`shrinkTrimSizeAndThreshold` addition supporting Direction A)
+- `pinot-core/src/main/java/org/apache/pinot/core/data/table/OffHeapGroupTable.java`
+  (Direction B initial prototype)
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedIndexedTable.java`
