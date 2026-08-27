@@ -330,18 +330,76 @@ java GC的问题").
 **What this prototype does NOT yet address** — the open questions from §5.2 are unchanged by
 these results, since they test a different axis:
 
-- Duplication factor (same key stored once per thread that observed it) is unmeasured in
-  this prototype — the workload above uses one independent table per simulated thread with no
-  merge step, so it does not exercise or quantify duplication at all.
 - The correctness risk from trimming a thread's partial view before merging (a key's true
   importance may only be known after merging) is unaddressed by design — this prototype has
   no merge or trim-before-merge logic exercised yet beyond the isolated `trimTo()` unit check.
 
-### 5.5 Open questions
+### 5.5 Duplication factor, measured on this prototype
 
-- Duplication-factor and correctness-risk impact, in combination with off-heap storage, are
-  still unmeasured (see above) — this is the most important remaining gap before this
-  direction can be compared on equal footing with Direction A.
+`DuplicationFactorOffHeap.java`: `NUM_THREADS=10` threads each independently draw
+`RECORDS_PER_THREAD=50,000` samples from the same Zipfian distribution (cardinality 20,000,
+per-thread local `trimTo(500)` before merge, matching `finish()` semantics — trim once at
+finalization, not continuously). Duplication factor = (sum of each thread's post-trim size) /
+(size of the union of keys that survive in at least one thread's post-trim table):
+
+| Skew | Surviving-key union | Total held | Duplication factor |
+|---|---|---|---|
+| 0.00 | 4,458 | 5,000 | 1.12x |
+| 0.15 | 3,932 | 5,000 | 1.27x |
+| 0.30 | 2,465 | 5,000 | 2.03x |
+| 0.50 | 1,344 | 5,000 | 3.72x |
+| 0.80 | 867 | 5,000 | 5.77x |
+| 1.00 | 824 | 5,000 | 6.07x |
+
+Monotonically increasing with skew, same direction as the earlier on-heap "simple" finding —
+**confirms duplication factor is a property of the per-thread-local-trim architecture, not of
+storage backend**, as hypothesized in §5.2: off-heap does not change which keys end up
+duplicated, only what each duplicate costs. The absolute magnitude here (up to 6.07x) is
+higher than the previously-cited 1.63x–3.45x range; that range used different parameters
+(trim capacity, thread/record counts) from a different session and should not be assumed to
+transfer — this is a parameter-dependent number that needs re-measuring under whatever the
+real production trim/thread configuration would be, not a fixed constant.
+
+(A first version of this measurement had a bug: it computed the denominator as every key ever
+*drawn* before trimming, which is close to full cardinality regardless of skew and produced a
+nonsensical duplication factor below 1.0. Fixed by only counting keys that *survive* each
+thread's local trim.)
+
+### 5.6 Does off-heap's GC benefit survive duplication?
+
+`CompareWithDuplication.java`: reran the §5.4 GC/wall-clock comparison, but now with the
+realistic per-thread-local-trim workload (matching §5.5's setup, not §5.4's untrimmed one),
+at the same scale as §5.4 (10 threads x 200,000 upserts, cardinality 100,000, trim to 5,000),
+at low-duplication (skew 0.0) and high-duplication (skew 1.0) extremes:
+
+| Skew | Impl | Total held | Wall-clock | GC time |
+|---|---|---|---|---|
+| 0.0 | on-heap | 50,000 | 283 ms | 29 ms |
+| 0.0 | off-heap | 50,000 | 286 ms | 2 ms |
+| 1.0 | on-heap | 50,000 | 173 ms | 16 ms |
+| 1.0 | off-heap | 50,000 | 165 ms | 3 ms |
+
+**GC-time advantage is robust**: off-heap stays far lower (81–93% less GC time) at both the
+low- and high-duplication extreme — duplication does not erase this benefit, since both
+implementations pay the identical duplication factor and off-heap still wins. This is the
+core claim from §5.4 holding up under a more realistic workload.
+
+**Wall-clock advantage is NOT robust once trimming is included**: off-heap is a wash-to-worse
+at skew 0.0 (286 vs 283 ms) and only modestly better at skew 1.0 (165 vs 173 ms) — unlike
+§5.4's untrimmed workload, where off-heap was ~38–40% faster outright. Likely cause: this
+prototype's current `trimTo()` sorts by boxing into `Double[]`/`Integer[]` internally (see
+the implementation), which reintroduces exactly the kind of per-entry allocation cost this
+design is meant to avoid, just during the trim step instead of the upsert step. This looks
+like a fixable implementation inefficiency (sort via a primitive index array instead of
+boxing) rather than a fundamental limit of the off-heap approach — but it has not been fixed
+or re-measured yet, so the wall-clock claim should not be overstated pending that fix.
+
+### 5.7 Open questions
+
+- Fix `trimTo()`'s boxing and re-measure wall-clock under duplication (§5.6) before claiming
+  a wall-clock win, not just a GC-time win.
+- The correctness risk from local pre-merge trimming (§5.2) is still entirely unaddressed by
+  this prototype.
 - Prototype is not integrated with real `QueryContext`/`DataSchema`/multi-column keys, and is
   not wired into the query engine.
 - No regression test suite — current verification is scratch scripts only, same caveat as
@@ -351,13 +409,19 @@ these results, since they test a different axis:
 
 No decision has been made between Direction A (sharding + adaptive capacity, fully
 implemented and verified against real classes, not yet wired into the query engine or
-regression-tested) and Direction B (per-thread + off-heap; initial prototype now confirms
-Jackie's GC-pressure rationale — ~95% less GC time, also faster wall-clock, in an isolated
-comparison — but has not yet measured the duplication-factor or correctness-risk costs the
-underlying per-thread architecture is already known to carry). The two are not mutually
-exclusive in principle (§5.3). Next step is Jackie's input on which to pursue — or whether to
-extend Direction B's prototype to measure duplication/correctness under merge before
-comparing it against Direction A's already-measured numbers on equal footing.
+regression-tested) and Direction B (per-thread + off-heap). Direction B's GC-pressure benefit
+(Jackie's stated rationale) holds up well: 81–93% less GC time than on-heap, confirmed robust
+to duplication (measured at both a 1.12x and a 6.07x duplication factor, §5.6) — this part of
+the proposal is on solid empirical footing. Two things are not yet resolved: (1) the
+wall-clock picture is mixed once a realistic trim step is included, likely fixable (§5.6);
+(2) the correctness risk inherited from the "simple" per-thread architecture (§5.2) is
+untouched by any of this and remains the largest unresolved question for Direction B — a
+low GC/memory cost does not help if the design still silently drops keys pre-merge at mild
+skew, which is a correctness property Direction A was specifically built to avoid. The two
+directions are not mutually exclusive in principle (§5.3). Next step is Jackie's input on
+which to pursue, or whether to close Direction B's remaining gaps (trim-boxing fix,
+correctness-under-merge measurement) before comparing it against Direction A on equal
+footing.
 
 ## 7. A note on benchmark rigor
 
