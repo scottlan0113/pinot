@@ -577,9 +577,48 @@ mask most of it.
 This is not a reason to abandon adaptive capacity — its entire value proposition is memory
 reduction under skew (§6.5's ~98% at skew=1.0), and this benchmark deliberately uses the one
 workload shape (uniform) where that value can never materialize, making it a worst-case
-overhead measurement, not a representative one. But it is a real, now-quantified cost that a
-skewed-workload JMH benchmark (not yet built) would be needed to weigh against the memory
-savings and recall guarantee — left as an open item (§6.6) rather than assumed away.
+overhead measurement, not a representative one. The skewed-workload follow-up below answers
+whether the memory savings pay back the overhead when adaptive capacity actually gets to use
+them.
+
+**Skewed-workload follow-up (`BenchmarkShardedOffHeapGroupTableSkewed.java`)**: same JMH rigor,
+but Zipfian keys (skew=1.0, cardinality 1,000,000) instead of uniform — the exact parameters
+`VerifyAdaptiveDirectionC.java` already validated collapse adaptive capacity from 217,168 to
+3,200 held entries (~98.5% reduction, recall@10=100%) — so this benchmark's adaptive variant
+pays the bookkeeping cost *and* collects the shrink benefit, unlike the uniform benchmark
+above. First run showed an outlier fork on `shardedOffHeapGroupTableFixed` (Fork 1:
+48,000-56,000 us/op vs. Forks 2-3's tight ~43,500-45,000 band, Score 46,293 ± 4,869) — not
+trusted, rerun per this document's own rigor standard (§8). Second run was clean, all 9 forks
+across all 3 benchmarks tight, no outliers:
+
+| Benchmark | Score (avgt, us/op) | Error (99.9% CI) | vs. Direction A |
+|---|---|---|---|
+| Direction A | 95,229.021 | ± 1,515.194 | baseline |
+| Direction C fixed | 43,722.839 | ± 167.442 | **2.18x faster** |
+| Direction C adaptive | 48,762.513 | ± 325.504 | **1.95x faster** |
+
+This corrects a premature read of the first (outlier-contaminated) run, which made fixed and
+adaptive look statistically tied — they are not. Adaptive is still a consistent ~11.5% slower
+than fixed (48,763 vs. 43,723 us/op) even with the shrink benefit included. But that overhead
+shrank dramatically from the uniform benchmark's ~67% gap, and adaptive's margin over Direction
+A nearly doubled (1.09x -> 1.95x) between the uniform and skewed workloads — the memory-reduction
+benefit clearly buys back most, not all, of the bookkeeping cost.
+
+A second, unplanned finding: Direction A's own absolute time roughly doubled under skew
+(44,517 -> 95,229 us/op) while both off-heap variants grew far less (fixed: 24,548 -> 43,723,
+~1.78x; adaptive: 41,044 -> 48,763, ~1.19x) — skew appears to cost Direction A's architecture
+specifically, not just make everything uniformly slower. Plausible cause: concurrent updates to
+the same hot key inside `ConcurrentHashMap` still serialize at the bucket level, and a
+Zipfian-skewed workload concentrates far more traffic onto that single bucket than a uniform
+one ever would. **Not confirmed** — this is an observation, not a profiled finding (the JMH
+output's own standard caveat applies: correlation in aggregate numbers isn't a mechanism), and
+is noted here rather than asserted as settled.
+
+**Net**: under the skewed regime #10498 actually cares about, Direction C's advantage over
+Direction A is larger, not smaller, than the uniform benchmark suggested, for both fixed and
+adaptive capacity. Adaptive capacity's bookkeeping cost is real but is more than justified by
+its ~98.5% memory reduction, and it still beats Direction A by a wide margin even carrying that
+cost.
 
 ### 6.5 Adaptive capacity ported from Direction A
 
@@ -671,12 +710,13 @@ many more shards) has not been tried and could plausibly need a smaller constant
   workload and a skew/cardinality sweep together — not yet verified against a workload with a
   much smaller per-shard sample volume than the ~15,625 both existing tests happen to share
   (see §6.5's closing caveat).
-- Performance is now JMH-rigor (§6.4's follow-up), but only on a uniform-key workload —
-  fixed capacity's ~1.81x margin over Direction A is confirmed, but adaptive capacity's margin
-  drops to ~9% because this workload never exercises the one thing adaptive capacity is for
-  (shrinking under skew), only its per-upsert bookkeeping cost. A skewed-workload JMH benchmark
-  — where adaptive both pays the bookkeeping cost AND gets the memory-reduction benefit — has
-  not been built, and is needed before adaptive's wall-clock tradeoff can be called settled.
+- Performance is now JMH-rigor under both a uniform and a skewed workload (§6.4). Resolved:
+  fixed capacity is 1.81-2.18x faster than Direction A depending on skew; adaptive capacity is
+  1.09-1.95x faster than Direction A and 11.5-67% slower than fixed capacity depending on skew
+  (worse on uniform data, where it has no shrink benefit to offset the bookkeeping cost; much
+  better under the skew #10498 actually targets). Not yet explained: why Direction A's own
+  absolute time roughly doubles under skew while both off-heap variants grow far less (§6.4's
+  skewed follow-up) — a real, reproduced observation, not yet a profiled mechanism.
 - The write-lock-for-every-upsert simplification (§6.2) is untested against a more
   fine-grained alternative (e.g. a lock-free or read-write-split scheme over the off-heap
   segment) — unknown how much headroom is being left on the table.
@@ -697,7 +737,7 @@ characterized on real implementations across the same three axes:
 
 | | A: sharding + adaptive capacity | B: per-thread + off-heap | C: sharding + off-heap |
 |---|---|---|---|
-| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed: fixed capacity 1.81x faster, adaptive capacity only ~1.09x faster (bookkeeping cost with no shrink benefit on this uniform-key workload — §6.4) + ~0 GC vs. Direction A itself |
+| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed under both uniform and skewed workloads: fixed capacity 1.81-2.18x faster, adaptive capacity 1.09-1.95x faster (wider margin under the skew #10498 targets) + ~0 GC vs. Direction A itself (§6.4) |
 | Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
 | Correctness risk | None found (§4.5) | Real: recall@10 drops to 62-92% at mild skew (§5.7), unmitigated | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3) |
 | Wired into query engine | No (§4.6) | No (§5.8) | No (§6.6) |
@@ -705,23 +745,22 @@ characterized on real implementations across the same three axes:
 
 **Direction C currently looks like the strongest candidate**: it inherits Direction A's
 correctness guarantee exactly (confirmed, not just argued by analogy — §6.3), its performance
-comparison is now JMH-confirmed rather than ad-hoc, and it now has Direction A's
-adaptive-capacity idea ported for the memory-ceiling problem (§4.2) with memory numbers
-matching Direction A's own (§6.5) — two real gate-tuning bugs were found and fixed along the
-way, both verified against a uniform and a skewed workload together, not just whichever one
-motivated the fix. It also now has a permanent regression suite, unlike either parent
-direction. The one number that got *less* flattering under rigor, not more, is adaptive
-capacity's own wall-clock margin (~9%, not the ~1.5x the ad-hoc numbers suggested) — a real,
-now-quantified bookkeeping cost that a skewed-workload JMH benchmark still needs to weigh
-against the memory savings before adaptive's performance story can be called settled (§6.4,
-§6.6). Direction B's standalone results remain useful as the underlying evidence that off-heap
-storage genuinely lowers GC pressure and that duplication does not erase that benefit
-(§5.5-§5.6) — but as a complete design, Direction B carries a correctness risk that Direction C
-does not, for what was (in this comparison) *better* performance, not worse — which weakens the
-case for choosing plain Direction B over Direction C specifically. Next step is Jackie's input
-on which direction(s) to keep pursuing — most plausibly Direction C, with a skewed-workload JMH
-benchmark and query-engine wiring as the concrete remaining work before it's ready to compare
-against Direction A on fully equal footing.
+comparison is now JMH-confirmed under both a uniform and a skewed workload, and it now has
+Direction A's adaptive-capacity idea ported for the memory-ceiling problem (§4.2) with memory
+numbers matching Direction A's own (§6.5) — two real gate-tuning bugs were found and fixed
+along the way, both verified against a uniform and a skewed workload together, not just
+whichever one motivated the fix. It also now has a permanent regression suite, unlike either
+parent direction. Adaptive capacity's wall-clock margin over Direction A got *less* flattering
+under rigor on uniform data (~9%, not the ~1.5x ad-hoc numbers suggested) but recovered to
+~1.95x under the skewed workload #10498 actually targets — the memory-reduction benefit does
+buy back most (not quite all) of the bookkeeping cost once it has skew to work with (§6.4).
+Direction B's standalone results remain useful as the underlying evidence that off-heap storage
+genuinely lowers GC pressure and that duplication does not erase that benefit (§5.5-§5.6) — but
+as a complete design, Direction B carries a correctness risk that Direction C does not, for what
+was (in this comparison) *better* performance, not worse — which weakens the case for choosing
+plain Direction B over Direction C specifically. Next step is Jackie's input on which
+direction(s) to keep pursuing — most plausibly Direction C, with query-engine wiring as the
+concrete remaining work before it's ready to compare against Direction A on fully equal footing.
 
 ## 8. A note on benchmark rigor
 
@@ -738,6 +777,16 @@ under ad-hoc timing (§6.4's original table); under JMH rigor that margin collap
 (§6.4's follow-up) once the measurement was precise enough to isolate the signal-tracking
 bookkeeping cost from the actual upsert cost. The direction of the error was different this
 time (optimistic, not just noisy) but the lesson is the same one this section already draws.
+
+A fourth, narrower instance: even JMH's own fork/warmup/multi-iteration discipline doesn't make
+a single run automatically trustworthy. The skewed-workload benchmark's first run (§6.4) had one
+outlier fork on `shardedOffHeapGroupTableFixed` (48,000-56,000 us/op vs. two other forks' tight
+~43,500-45,000 band) that would have made fixed and adaptive capacity look statistically tied —
+a materially different, more flattering conclusion for adaptive than the true result. Caught
+only by checking individual fork data, not just the aggregated Score/Error line, and resolved by
+a full rerun (clean on all 9 forks the second time). The standard from §2/§6.4 extends here too:
+JMH rigor lowers the *rate* of misleading numbers, it doesn't eliminate the need to look at the
+underlying iterations before trusting an aggregate.
 
 ## 9. References
 
@@ -756,6 +805,8 @@ time (optimistic, not just noisy) but the lesson is the same one this section al
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedIndexedTable.java`
   (Direction A JMH benchmark)
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedOffHeapGroupTable.java`
-  (Direction A vs. C JMH benchmark, §6.4's follow-up)
+  (Direction A vs. C JMH benchmark, uniform-key workload, §6.4's follow-up)
+- `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedOffHeapGroupTableSkewed.java`
+  (Direction A vs. C JMH benchmark, skewed-key workload, §6.4's skewed follow-up)
 - `pinot-core/src/test/java/org/apache/pinot/core/data/table/ShardedOffHeapGroupTableTest.java`
   (Direction C regression suite)
