@@ -623,15 +623,32 @@ among the values tested, and remains the recommended default** — `NUM_SUB_SEGM
 benchmark and any future caller should use 4 unless a different workload's own sweep says
 otherwise.
 
-Plausible mechanism, **not yet profiled or confirmed**: `ShardedOffHeapGroupTable`'s constructor
-divides `perShardInitialCapacity` by `numSubSegments` for each sub-segment's own initial
-capacity (`Math.max(1, perShardInitialCapacity / numSubSegments)`), so larger `numSubSegments`
-means smaller initial capacity per sub-segment — plausibly triggering more frequent
-`growData()`/`growIndex()` resize events (each a real O(size) copy, not free) that eventually
-outweigh the contention-reduction benefit from finer locking. A follow-up that holds each
-sub-segment's initial capacity constant regardless of `numSubSegments` (instead of dividing)
-would help confirm or rule this out — not done, flagged as the natural next step if this is
-worth refining further, not asserted as the explanation.
+**The resize-frequency hypothesis above was tested directly and REFUTED — with a methodology
+flaw worth recording, not just the negative result.** Added a `divideInitialCapacityAcrossSubSegments`
+constructor flag (default `true` = existing behavior) and benchmarked
+`FixedSubSegmented16FullCapacity`/`32FullCapacity` (`false`: every sub-segment gets the full,
+undivided `perShardInitialCapacity` instead of a fraction of it) against the original divided
+variants. If smaller per-sub-segment capacity (more frequent resize) were the cause, the
+undivided variants should have recovered toward K=4's ~42,800 us/op. Instead, both got
+*dramatically* slower — K16: 44,865 -> 61,659 us/op; K32: 48,266 -> 85,800 us/op (noisier too,
+though every iteration checked individually, no single outlier — genuinely more variable, not a
+measurement artifact). Clean and reproducible in both directions, so the hypothesis is
+confirmed wrong, not just unconfirmed.
+
+The flaw: "undivided" was not a clean isolation of "resize frequency" — since capacity per
+sub-segment stays at the FULL `perShardInitialCapacity` regardless of `numSubSegments`, total
+initial off-heap allocation for a shard scales *with* `numSubSegments` (32x more total memory
+allocated upfront at K=32, not the same total split differently). This experiment therefore
+measured "does massively over-allocating initial capacity hurt performance" (yes, apparently —
+consistent with the raw cost of allocating and OS-mapping that much more off-heap memory before
+any upsert work even begins), not "does resize frequency matter" — those got conflated by this
+specific test design. **The original question — does per-sub-segment resize frequency, at a
+constant TOTAL capacity, explain the K=16/32 regression — remains open.** A properly isolated
+follow-up would need to hold total per-shard capacity constant while varying how many pieces
+it's split into (e.g. distributing unevenly, or pre-sizing each sub-segment from actual expected
+load rather than an even division) — not attempted here, this investigation stopped after
+learning the over-allocation cost is real and large enough to dominate whatever it was mixed
+with.
 
 ### 6.3 Correctness: real concurrent threads, not simulation
 
@@ -903,11 +920,18 @@ many more shards) has not been tried and could plausibly need a smaller constant
   read-side `ThreadLocal` bookkeeping costs more than the write lock saves for a critical section
   this short (§6.2). Reverted. Sub-segmenting each outer shard (still exclusive locks throughout,
   just finer-grained) was tried next and DID help — fixed capacity with `numSubSegments=4` is
-  6.9-8.1% faster than `numSubSegments=1` across two clean runs (§6.2) — kept, not reverted. Not
-  yet tried: whether a larger `numSubSegments` (8, 16, ...) helps further or where the returns
-  flatten out; a fully lock-free scheme (no `ReentrantReadWriteLock` at all) remains a different,
-  unexplored, higher-risk idea that a design-phase review (not yet an implementation attempt)
-  found a real correctness hazard in around concurrent resize — see the session notes for the
+  6.9-8.1% faster than `numSubSegments=1` across two clean runs (§6.2) — kept, not reverted. A
+  sweep found this does NOT keep improving with larger `numSubSegments`: 8 is back near the
+  baseline, 16/32 are measurably worse than never sub-segmenting at all — non-monotonic, not
+  diminishing returns. The "smaller per-sub-segment capacity causes more frequent resize"
+  hypothesis for that regression was tested directly and REFUTED (giving every sub-segment full
+  undivided capacity made K=16/32 dramatically *worse*, not better, since it also scales total
+  allocation with `numSubSegments`) — why K=16/32 regress at a properly constant total capacity
+  is still genuinely unknown, not just unconfirmed. `numSubSegments=4` remains the recommended
+  default regardless. A fully lock-free scheme (no `ReentrantReadWriteLock` at all) remains a
+  different, unexplored, higher-risk idea that a design-phase review (not yet an implementation
+  attempt) found a real correctness hazard in around concurrent resize — see the session notes
+  for the
   reasoning; not pursued given sub-segmenting already delivered a real win at much lower risk.
 - Not wired into the query engine (same as both parent directions). A regression test suite now
   exists (`ShardedOffHeapGroupTableTest.java`, `pinot-core/src/test/java/org/apache/pinot/core/

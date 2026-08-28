@@ -66,10 +66,14 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 ///
 /// numSubSegments does NOT monotonically help -- a JMH sweep (DESIGN.md Sec 6.2) found 4 to be the
 /// clear sweet spot (a real 6.9-8.1% win over numSubSegments=1), with 8 back near the numSubSegments=1
-/// baseline and 16/32 measurably WORSE than never sub-segmenting at all. Plausible, not yet confirmed,
-/// cause: perSubSegmentInitialCapacity below is perShardInitialCapacity / numSubSegments, so larger
-/// numSubSegments means smaller initial capacity per sub-segment and likely more frequent resize
-/// events. Callers should default to numSubSegments=4 rather than assuming higher is better.
+/// baseline and 16/32 measurably WORSE than never sub-segmenting at all. Callers should default to
+/// numSubSegments=4 rather than assuming higher is better. The initial hypothesis -- smaller
+/// per-sub-segment initial capacity (from dividing perShardInitialCapacity by numSubSegments) causing
+/// more frequent resize -- was tested directly via divideInitialCapacityAcrossSubSegments=false below
+/// and REFUTED: giving every sub-segment the full undivided capacity made K=16/32 dramatically worse
+/// (e.g. K=32: 48,266 -> 85,800 us/op), not better, because that also scales TOTAL initial allocation
+/// with numSubSegments rather than isolating resize frequency at a constant total. Why K=16/32 regress
+/// at a properly constant total capacity remains an open question.
 ///
 /// Arena lifecycle: one Arena.ofShared() (NOT ofConfined() -- confined arenas restrict access to their
 /// creating thread, which would throw for every other thread touching a shared shard) backs every
@@ -134,6 +138,25 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   ///                        adaptiveCapacity=false.
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
       boolean adaptiveCapacity, int numSubSegments) {
+    this(numShards, perShardInitialCapacity, fullCapacity, adaptiveCapacity, numSubSegments, true);
+  }
+
+  /// @param divideInitialCapacityAcrossSubSegments If true (matches the 5-arg constructor above and
+  ///                        all prior behavior), perShardInitialCapacity is divided by numSubSegments
+  ///                        for each sub-segment's own initial off-heap allocation -- more
+  ///                        numSubSegments means less initial capacity per piece. If false, EVERY
+  ///                        sub-segment starts at perShardInitialCapacity directly (numSubSegments
+  ///                        times more total initial memory for the shard). Was added to test whether
+  ///                        smaller per-sub-segment capacity (more frequent resize) explained the
+  ///                        higher-numSubSegments regression (DESIGN.md Sec 6.2) -- it does not:
+  ///                        `false` measured DRAMATICALLY slower (K=32: 48,266 -> 85,800 us/op), not
+  ///                        faster, because it also scales TOTAL initial allocation with
+  ///                        numSubSegments instead of holding it constant. Kept as a real, working
+  ///                        knob (over-allocating capacity is a genuine, separate cost worth being
+  ///                        able to reproduce/avoid), not as a fix for the original regression, which
+  ///                        this ruled out rather than explained.
+  public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
+      boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments) {
     if (adaptiveCapacity && numSubSegments > 1) {
       throw new IllegalArgumentException("Sub-segmenting is not yet supported for adaptive capacity");
     }
@@ -150,7 +173,8 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
     _runningTotal = new double[numShards];
     _sampleCount = new long[numShards];
     _currentTier = new int[numShards];
-    int perSubSegmentInitialCapacity = Math.max(1, perShardInitialCapacity / numSubSegments);
+    int perSubSegmentInitialCapacity = divideInitialCapacityAcrossSubSegments
+        ? Math.max(1, perShardInitialCapacity / numSubSegments) : perShardInitialCapacity;
     for (int i = 0; i < numShards; i++) {
       for (int j = 0; j < numSubSegments; j++) {
         _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, _arena);

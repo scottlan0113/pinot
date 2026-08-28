@@ -223,6 +223,33 @@ public class BenchmarkShardedOffHeapGroupTableSkewed {
     }
   }
 
+  /// Tests the resize-frequency hypothesis for why K=16/32 regressed (DESIGN.md Sec 6.2): here every
+  /// sub-segment gets the FULL perShardInitialCapacity instead of perShardInitialCapacity/numSubSegments
+  /// (divideInitialCapacityAcrossSubSegments=false), so if the regression was caused by smaller initial
+  /// capacity triggering more frequent growData()/growIndex(), these variants should recover toward
+  /// shardedOffHeapGroupTableFixedSubSegmented4's number instead of staying slow.
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented16FullCapacity()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 16, false)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented32FullCapacity()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 32, false)) {
+      runDirectionC(table);
+    }
+  }
+
   private void runDirectionC(ShardedOffHeapGroupTable table)
       throws InterruptedException {
     CountDownLatch operatorLatch = new CountDownLatch(NUM_SEGMENTS);
