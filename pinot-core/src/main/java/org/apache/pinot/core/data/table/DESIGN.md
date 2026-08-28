@@ -602,6 +602,37 @@ first of three optimization attempts in this section that actually helped. Kept:
 `numSubSegments=1`, unchanged behavior), so nothing about this needed reverting the way the
 first two attempts did.
 
+**Swept `numSubSegments` past 4 to see whether more is better — it is not.** Added
+`shardedOffHeapGroupTableFixedSubSegmented8/16/32` alongside the existing 4, all against the
+same `shardedOffHeapGroupTableFixed` (`numSubSegments=1`) baseline. Result, clean on every fork
+(one run needed a targeted rerun of just K=32 — its first pass had two elevated iterations in
+one fork; the rerun's aggregate agreed with the original within ~0.1%, confirming the number
+despite fork-to-fork spread higher than K=4/K=8 showed):
+
+| `numSubSegments` | Score (us/op) | vs. Direction A | vs. K=4 |
+|---|---|---|---|
+| 1 (baseline) | 45,326 | 2.06x | +6.7% slower |
+| **4** | **42,497** | **2.19x** | **best** |
+| 8 | 45,182 | 2.06x | +6.3% slower |
+| 16 | 46,586 | 2.00x | +9.6% slower |
+| 32 | 46,532 | 2.00x | +9.5% slower |
+
+Non-monotonic, not just diminishing returns: performance improves from K=1 to K=4, then gets
+*worse* than the K=1 baseline from K=8 onward, worst at K=16-32. **K=4 is the clear sweet spot
+among the values tested, and remains the recommended default** — `NUM_SUB_SEGMENTS` in the
+benchmark and any future caller should use 4 unless a different workload's own sweep says
+otherwise.
+
+Plausible mechanism, **not yet profiled or confirmed**: `ShardedOffHeapGroupTable`'s constructor
+divides `perShardInitialCapacity` by `numSubSegments` for each sub-segment's own initial
+capacity (`Math.max(1, perShardInitialCapacity / numSubSegments)`), so larger `numSubSegments`
+means smaller initial capacity per sub-segment — plausibly triggering more frequent
+`growData()`/`growIndex()` resize events (each a real O(size) copy, not free) that eventually
+outweigh the contention-reduction benefit from finer locking. A follow-up that holds each
+sub-segment's initial capacity constant regardless of `numSubSegments` (instead of dividing)
+would help confirm or rule this out — not done, flagged as the natural next step if this is
+worth refining further, not asserted as the explanation.
+
 ### 6.3 Correctness: real concurrent threads, not simulation
 
 Every Direction B measurement (§5) used *simulated* per-thread tables — one thread at a time,

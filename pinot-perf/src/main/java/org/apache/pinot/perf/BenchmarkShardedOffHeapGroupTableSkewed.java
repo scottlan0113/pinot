@@ -60,11 +60,12 @@ import org.openjdk.jmh.runner.options.TimeValue;
 /// exactly, so the shrinkage this benchmark exercises is a known, already-validated quantity rather
 /// than an untested combination of skewed keys with random values.
 ///
-/// `shardedOffHeapGroupTableFixedSubSegmented` measures the sub-segmenting idea (DESIGN.md Sec 6.2):
-/// each outer shard split into NUM_SUB_SEGMENTS independently-locked pieces, keeping the exact
+/// `shardedOffHeapGroupTableFixedSubSegmentedN` sweeps the sub-segmenting idea (DESIGN.md Sec 6.2)
+/// across N=4/8/16/32: each outer shard split into N independently-locked pieces, keeping the exact
 /// exclusive-lock-per-critical-section model that beat the read-lock fast path, just at finer
-/// granularity -- against `shardedOffHeapGroupTableFixed` (NUM_SUB_SEGMENTS=1, unchanged) as the
-/// direct baseline.
+/// granularity -- against `shardedOffHeapGroupTableFixed` (N=1, unchanged) as the direct baseline.
+/// N=4 alone already measured a real 6.9-8.1% win (§6.2); this sweep exists to find where returns
+/// flatten out or reverse, not just confirm the first data point again.
 @State(Scope.Benchmark)
 public class BenchmarkShardedOffHeapGroupTableSkewed {
   private static final int TRIM_SIZE = 5000;
@@ -74,7 +75,6 @@ public class BenchmarkShardedOffHeapGroupTableSkewed {
   private static final int NUM_SEGMENTS = 10;
   private static final int CARDINALITY = 1_000_000;
   private static final double SKEW = 1.0;
-  private static final int NUM_SUB_SEGMENTS = 4;
 
   private QueryContext _queryContext;
   private DataSchema _dataSchema;
@@ -182,10 +182,43 @@ public class BenchmarkShardedOffHeapGroupTableSkewed {
   @Benchmark
   @BenchmarkMode(Mode.AverageTime)
   @OutputTimeUnit(TimeUnit.MICROSECONDS)
-  public void shardedOffHeapGroupTableFixedSubSegmented()
+  public void shardedOffHeapGroupTableFixedSubSegmented4()
       throws InterruptedException {
     try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
-        TRIM_SIZE, false, NUM_SUB_SEGMENTS)) {
+        TRIM_SIZE, false, 4)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented8()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 8)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented16()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 16)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented32()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 32)) {
       runDirectionC(table);
     }
   }

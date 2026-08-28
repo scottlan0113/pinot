@@ -64,6 +64,13 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// OffHeapGroupTable's own upsert()) before trimming, so totalSize()/forEachEntry() only ever need to
 /// look at sub-segment 0 per shard -- consistent whether numSubSegments is 1 or more.
 ///
+/// numSubSegments does NOT monotonically help -- a JMH sweep (DESIGN.md Sec 6.2) found 4 to be the
+/// clear sweet spot (a real 6.9-8.1% win over numSubSegments=1), with 8 back near the numSubSegments=1
+/// baseline and 16/32 measurably WORSE than never sub-segmenting at all. Plausible, not yet confirmed,
+/// cause: perSubSegmentInitialCapacity below is perShardInitialCapacity / numSubSegments, so larger
+/// numSubSegments means smaller initial capacity per sub-segment and likely more frequent resize
+/// events. Callers should default to numSubSegments=4 rather than assuming higher is better.
+///
 /// Arena lifecycle: one Arena.ofShared() (NOT ofConfined() -- confined arenas restrict access to their
 /// creating thread, which would throw for every other thread touching a shared shard) backs every
 /// shard's memory. close() closes it once, freeing every shard's memory together.
