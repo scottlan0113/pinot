@@ -112,6 +112,56 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   @Test
+  public void testFixedCapacityUnderHeavyContention()
+      throws Exception {
+    // Originally written for a read-lock fast path (ShardedOffHeapGroupTable.upsert /
+    // OffHeapGroupTable.tryFastUpdate) that was tried and reverted after being measured to regress
+    // performance -- see DESIGN.md Sec 6.2/6.4. Kept as general heavy-contention coverage for the
+    // write-lock-per-upsert design that's actually in place: a small cardinality with many threads
+    // maximizes contention on a handful of shards, including many threads simultaneously missing an
+    // as-yet-nonexistent key and racing to insert it (must produce exactly one entry per key, not
+    // duplicates, and lose no upserts either way).
+    int cardinality = 20;
+    int numThreads = 20;
+    int upsertsPerThread = 200_000;
+    ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+    Map<Integer, Double> groundTruth = new ConcurrentHashMap<>();
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 16, Integer.MAX_VALUE,
+        false)) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < numThreads; t++) {
+        long seed = 2000L + t;
+        futures.add(executor.submit(() -> {
+          Random random = new Random(seed);
+          for (int r = 0; r < upsertsPerThread; r++) {
+            int key = random.nextInt(cardinality);
+            double value = random.nextDouble() * 100;
+            table.upsert(key, value);
+            groundTruth.merge(key, value, Double::sum);
+          }
+        }));
+      }
+      for (Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+      executor.shutdown();
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), cardinality, "Expected every key to survive (no trim at "
+          + "this capacity) with no duplicates from the fast-path/slow-path insert race");
+      Assert.assertEquals(table.totalSize(), groundTruth.size());
+      Map<Integer, Double> result = new java.util.HashMap<>();
+      table.forEachEntry(result::put);
+      for (Map.Entry<Integer, Double> entry : groundTruth.entrySet()) {
+        Assert.assertEquals(result.get(entry.getKey()), entry.getValue(), 1e-6,
+            "Mismatch for key " + entry.getKey() + " -- lost or double-counted update under contention");
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
   public void testAdaptiveCapacityNoFalsePositiveOnUniformData()
       throws Exception {
     // Regression case for both historical gate bugs: with keys AND values both effectively uniform

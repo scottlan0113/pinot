@@ -506,6 +506,55 @@ in its own `close()` (the owner — here, `ShardedOffHeapGroupTable` — closes 
 every shard is done). The original single-arg constructor (own confined arena, owns its own
 lifecycle) is unchanged, so every existing Direction B usage/test still works as before.
 
+**Tried a finer-grained fast path, measured a real regression, reverted.** Stack profiling
+(§6.4) found ~52% of thread-samples parked on this exact write lock, identically for fixed and
+adaptive capacity — real evidence the "measure, don't assume" flag above deserved a real
+attempt, not just a note. Built a fast path for fixed capacity only: `upsert()` takes a shared
+*read* lock first, tries `OffHeapGroupTable.tryFastUpdate(key, value)` (a new method — probes
+the index read-only, then atomically updates the value slot for an existing key), and only
+escalates to the write lock when the key genuinely doesn't exist yet (which mutates the index
+and is never safe under a shared lock). Adaptive capacity was deliberately left untouched in
+this attempt — its signal tracking uses plain fields safe only under exclusive access, and
+making that safe under a shared lock (`DoubleAdder`/`LongAdder`/CAS-based max, mirroring
+`AdaptiveConcurrentIndexedTable`) is a separate piece of work.
+
+Caught a real bug before it went anywhere near correctness testing: `VarHandle.getAndAdd`
+throws `UnsupportedOperationException` for a `MemorySegment` double `VarHandle` in this JDK —
+found by actually running the new concurrency stress test (see below), not assumed to work
+from the API surface. Fixed with a compare-and-swap retry loop
+(`VarHandle.compareAndSet`) instead, the more universally-supported access mode.
+
+Verified correctness thoroughly given the added concurrency risk: a new stress test
+(`testFixedCapacityUnderHeavyContention`, kept — see below) — 20 threads, cardinality 20,
+maximizing both CAS contention on existing keys and the race of many threads simultaneously
+missing the fast path for a not-yet-inserted key. 28 total clean runs (20 ad-hoc + 8 through
+the real `mvn test` pipeline) with zero failures before performance was measured at all.
+
+Then measured performance, expecting an improvement: instead, a confirmed, reproducible
+**regression**. Two independent JMH runs of the skewed benchmark: 48,463 then 51,087 us/op,
+both well above the write-lock-only baseline of 43,723 — getting worse, not better, across
+runs. Profiled the regression directly: the new run's stack sample showed
+`ReentrantReadWriteLock$Sync.tryAcquireShared`/`tryReleaseShared` and
+`ThreadLocal$ThreadLocalMap.cleanSomeSlots` as real, distinct costs that never appeared in the
+write-lock-only profile — `ReentrantReadWriteLock`'s read side carries `ThreadLocal`-based
+hold-count bookkeeping (needed to correctly support reentrant read locks and detect the "last
+reader releasing" case) that the write-only path never pays. For a critical section this short
+(one index probe plus one CAS on a double), that fixed per-acquisition overhead outweighed
+whatever parallelism the shared lock bought back. This matches well-documented Java concurrency
+guidance: `ReentrantReadWriteLock` earns its keep on long/expensive critical sections, not
+uniformly — it was the wrong tool for a critical section this cheap, not a broken idea in
+general.
+
+Reverted completely: `OffHeapGroupTable.tryFastUpdate` and its `VarHandle` field removed,
+`ShardedOffHeapGroupTable.upsert()` restored to always take the write lock. The stress test
+(renamed from `testFixedCapacityFastPathUnderHeavyContention` to
+`testFixedCapacityUnderHeavyContention`) was kept — heavy-contention correctness coverage for
+the write-lock design that's actually in place is still valuable, independent of why it was
+originally written. The `getAndAdd`-unsupported-for-double finding is real and worth keeping
+even though the attempt it was found inside was reverted: anyone reaching for `VarHandle`
+atomics on off-heap `double` values in a future attempt should use `compareAndSet`, not
+`getAndAdd`, from the start.
+
 ### 6.3 Correctness: real concurrent threads, not simulation
 
 Every Direction B measurement (§5) used *simulated* per-thread tables — one thread at a time,
@@ -770,9 +819,13 @@ many more shards) has not been tried and could plausibly need a smaller constant
   to ~11.5% under real contention because both variants pay nearly the same absolute lock-wait
   time — §6.4's follow-up). Read as a small, tightly-bounded cost with a low ceiling for further
   optimization, not an unsolved problem.
-- The write-lock-for-every-upsert simplification (§6.2) is untested against a more
-  fine-grained alternative (e.g. a lock-free or read-write-split scheme over the off-heap
-  segment) — unknown how much headroom is being left on the table.
+- The write-lock-for-every-upsert design is no longer untested, and is not an open question: a
+  read-write-split fast path was built, verified correct (28 clean concurrency runs), and
+  measured to REGRESS performance (43,723 -> 48,463 -> 51,087 us/op) — `ReentrantReadWriteLock`'s
+  read-side `ThreadLocal` bookkeeping costs more than the write lock saves for a critical section
+  this short (§6.2). Reverted. A lock-free scheme (no `ReentrantReadWriteLock` at all, pure CAS
+  with a different mechanism for the insert-vs-update race) is a different, unexplored idea that
+  wouldn't carry this specific overhead — not tried, no evidence either way.
 - Not wired into the query engine (same as both parent directions). A regression test suite now
   exists (`ShardedOffHeapGroupTableTest.java`, `pinot-core/src/test/java/org/apache/pinot/core/
   data/table/`) covering basic correctness, same-key-same-shard routing under real concurrent
@@ -811,9 +864,13 @@ Direction B's standalone results remain useful as the underlying evidence that o
 genuinely lowers GC pressure and that duplication does not erase that benefit (§5.5-§5.6) — but
 as a complete design, Direction B carries a correctness risk that Direction C does not, for what
 was (in this comparison) *better* performance, not worse — which weakens the case for choosing
-plain Direction B over Direction C specifically. Next step is Jackie's input on which
-direction(s) to keep pursuing — most plausibly Direction C, with query-engine wiring as the
-concrete remaining work before it's ready to compare against Direction A on fully equal footing.
+plain Direction B over Direction C specifically. The write-lock-per-upsert design (§6.2) is also
+no longer just an unexamined simplification — it was directly compared against a finer-grained
+read-write-split alternative and won, so the numbers above reflect a design that was tested
+against its own obvious alternative, not merely the first thing that worked. Next step is
+Jackie's input on which direction(s) to keep pursuing — most plausibly Direction C, with
+query-engine wiring as the concrete remaining work before it's ready to compare against
+Direction A on fully equal footing.
 
 ## 8. A note on benchmark rigor
 
@@ -840,6 +897,17 @@ only by checking individual fork data, not just the aggregated Score/Error line,
 a full rerun (clean on all 9 forks the second time). The standard from §2/§6.4 extends here too:
 JMH rigor lowers the *rate* of misleading numbers, it doesn't eliminate the need to look at the
 underlying iterations before trusting an aggregate.
+
+A fifth instance, this time working as intended rather than catching a prior mistake: the
+read-lock fast-path attempt (§6.2) was motivated by real profiling evidence and implemented
+carefully (28 clean concurrency runs before performance was even measured), but still turned out
+to make things worse, not better. The first JMH run alone (48,463 us/op vs. 43,723 baseline)
+would have been reason enough to suspect a regression, but an independent second run (51,087 —
+getting worse, not converging back toward baseline) is what ruled out "unlucky noisy run" as the
+explanation before committing to a revert. Worth naming because it cuts the other way from the
+first four instances: those all caught an unrigorous number being *wrong*; this one confirmed a
+rigorously-measured number was simply *bad news*, and the discipline was to trust it and revert
+rather than look for a reason to keep the change.
 
 ## 9. References
 

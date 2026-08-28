@@ -43,6 +43,12 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// DoubleAdder/DoubleAccumulator AdaptiveConcurrentIndexedTable needed -- every upsert already holds the
 /// shard's exclusive write lock, so there is no separate concurrency problem left to solve for the signal.
 ///
+/// A read-lock-based fast path (fixed capacity takes a shared read lock plus an atomic CAS for an
+/// existing key, escalating to the write lock only for a genuinely new key) was tried and MEASURED TO
+/// REGRESS performance -- see DESIGN.md Sec 6.2/6.4 for the full story and profiling evidence. Reverted.
+/// The write-lock-for-every-upsert design here is not an unexamined default; it was compared directly
+/// against a more fine-grained alternative and won.
+///
 /// Arena lifecycle: one Arena.ofShared() (NOT ofConfined() -- confined arenas restrict access to their
 /// creating thread, which would throw for every other thread touching a shared shard) backs every
 /// shard's memory. close() closes it once, freeing every shard's memory together.
