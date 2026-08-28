@@ -19,6 +19,7 @@
 package org.apache.pinot.core.data.table;
 
 import java.lang.foreign.Arena;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.DoubleAccumulator;
 import java.util.concurrent.atomic.DoubleAdder;
@@ -83,6 +84,13 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// (still exclusive, just finer-grained) makes it a plausible extrapolation rather than a fresh
 /// question, but it hasn't been independently re-swept.
 ///
+/// Multi-column keys: numKeyColumns > 1 (DESIGN.md Sec 4.6's "multi-column GROUP BY... not yet tested"
+/// scope item) switches every shard's underlying OffHeapGroupTable into its multi-column mode and
+/// requires the upsert(int[], double) overload instead of upsert(int, double) -- see OffHeapGroupTable's
+/// own class Javadoc for why the two modes are mutually exclusive per table instance. Shard and
+/// sub-segment routing both hash the full composite key (not just the first column), and adaptive
+/// capacity's top1Share signal is unaffected either way -- it only ever looks at VALUES.
+///
 /// Arena lifecycle: one Arena.ofShared() (NOT ofConfined() -- confined arenas restrict access to their
 /// creating thread, which would throw for every other thread touching a shared shard) backs every
 /// shard's memory. close() closes it once, freeing every shard's memory together.
@@ -104,6 +112,7 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
 
   private final int _numShards;
   private final int _numSubSegments;
+  private final int _numKeyColumns;
   private final boolean _adaptiveCapacity;
   private final int _fullCapacity;
   private final int _mediumCapacity;
@@ -168,8 +177,25 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   ///                        this ruled out rather than explained.
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
       boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments) {
+    this(numShards, perShardInitialCapacity, fullCapacity, adaptiveCapacity, numSubSegments,
+        divideInitialCapacityAcrossSubSegments, 1);
+  }
+
+  /// @param numKeyColumns Number of int GROUP BY key columns (added while testing DESIGN.md's
+  ///                       "multi-column GROUP BY... not yet tested" scope item, Sec 4.6). 1 = existing
+  ///                       behavior exactly (upsert(int, double), the scalar overload). > 1 switches
+  ///                       every shard's underlying OffHeapGroupTable into its multi-column mode
+  ///                       (upsert(int[], double) required instead -- see OffHeapGroupTable's class
+  ///                       Javadoc for why the two modes cannot be mixed on one table). Orthogonal to
+  ///                       adaptiveCapacity and numSubSegments -- the top1Share signal only depends on
+  ///                       VALUES, and sub-segment/shard routing only depend on a hash of the key,
+  ///                       neither of which cares how many int columns make up that key.
+  public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
+      boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments,
+      int numKeyColumns) {
     _numShards = numShards;
     _numSubSegments = numSubSegments;
+    _numKeyColumns = numKeyColumns;
     _adaptiveCapacity = adaptiveCapacity;
     _fullCapacity = fullCapacity;
     _mediumCapacity = Math.max(1, fullCapacity / 10);
@@ -189,7 +215,7 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
       _sampleCount[i] = new LongAdder();
       _currentTier[i] = new AtomicInteger(0);
       for (int j = 0; j < numSubSegments; j++) {
-        _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, _arena);
+        _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, numKeyColumns, _arena);
         _locks[i][j] = new ReentrantReadWriteLock();
       }
     }
@@ -214,6 +240,30 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
     return Math.floorMod(h, _numSubSegments);
   }
 
+  /// Multi-column counterparts to shardFor/subSegmentFor above, same decorrelation reasoning: shard
+  /// selection uses a simple/raw hash (Arrays.hashCode, the multi-column analogue of
+  /// Integer.hashCode(key) being just `key` itself for the single-column case) while sub-segment
+  /// selection uses the avalanche-mixed hash, so the two choices don't correlate.
+  private int shardForMulti(int[] keys) {
+    return Math.floorMod(Arrays.hashCode(keys), _numShards);
+  }
+
+  private int subSegmentForMulti(int[] keys) {
+    if (_numSubSegments == 1) {
+      return 0;
+    }
+    return Math.floorMod(avalancheHash(keys), _numSubSegments);
+  }
+
+  private static int avalancheHash(int[] keys) {
+    int h = 1;
+    for (int k : keys) {
+      h = h * 31 + k;
+    }
+    h *= 0x9E3779B1;
+    return h ^ (h >>> 16);
+  }
+
   /// Thread-safe: takes the target shard's (and sub-segment's) write lock for the full duration of the
   /// upsert. Safe to call concurrently from multiple threads on the same table (that's the whole point)
   /// -- different keys hashing to different shards, or to different sub-segments of the same shard,
@@ -225,6 +275,24 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
     lock.writeLock().lock();
     try {
       double updatedValue = _shards[shard][subSegment].upsert(key, value);
+      if (_adaptiveCapacity) {
+        updateSignal(shard, value, updatedValue);
+      }
+    } finally {
+      lock.writeLock().unlock();
+    }
+  }
+
+  /// Multi-column counterpart to upsert(int, double) above -- identical locking/signal-tracking
+  /// behavior, keyed by keys.length int columns instead of one. Only valid on a table constructed with
+  /// numKeyColumns > 1 matching keys.length (enforced by the underlying OffHeapGroupTable).
+  public void upsert(int[] keys, double value) {
+    int shard = shardForMulti(keys);
+    int subSegment = subSegmentForMulti(keys);
+    ReentrantReadWriteLock lock = _locks[shard][subSegment];
+    lock.writeLock().lock();
+    try {
+      double updatedValue = _shards[shard][subSegment].upsert(keys, value);
       if (_adaptiveCapacity) {
         updateSignal(shard, value, updatedValue);
       }
@@ -298,8 +366,14 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
         for (int j = 1; j < _numSubSegments; j++) {
           OffHeapGroupTable other = _shards[i][j];
           int size = other.size();
-          for (int k = 0; k < size; k++) {
-            primary.upsert(other.keyAt(k), other.valueAt(k));
+          if (_numKeyColumns == 1) {
+            for (int k = 0; k < size; k++) {
+              primary.upsert(other.keyAt(k), other.valueAt(k));
+            }
+          } else {
+            for (int k = 0; k < size; k++) {
+              primary.upsert(other.keysAt(k), other.valueAt(k));
+            }
           }
         }
         primary.trimTo(capacityFor(i));
@@ -337,6 +411,21 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
 
   public interface EntryVisitor {
     void visit(int key, double value);
+  }
+
+  /// Multi-column counterpart to forEachEntry() -- same finishAllShards()-then-read contract.
+  public void forEachMultiColumnEntry(MultiColumnEntryVisitor visitor) {
+    for (OffHeapGroupTable[] shard : _shards) {
+      OffHeapGroupTable merged = shard[0];
+      int size = merged.size();
+      for (int i = 0; i < size; i++) {
+        visitor.visit(merged.keysAt(i), merged.valueAt(i));
+      }
+    }
+  }
+
+  public interface MultiColumnEntryVisitor {
+    void visit(int[] keys, double value);
   }
 
   @Override

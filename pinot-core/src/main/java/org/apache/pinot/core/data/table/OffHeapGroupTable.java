@@ -33,78 +33,120 @@ import java.util.Arrays;
 /// Scope matches Direction A for apples-to-apples comparison: single INT group-by key, single DOUBLE
 /// SUM-like aggregate (mirrors every benchmark used throughout this investigation, GROUP BY d1 / sum(m1)).
 ///
-/// Layout: each off-heap record is 16 bytes -- 4-byte int key (offset 0) + 8-byte double value (offset 8,
-/// naturally aligned; bytes 4-7 are padding). An on-heap open-addressing int->int index (key -> off-heap
-/// slot index) provides O(1) average lookup; this index itself is small primitive arrays, not boxed
-/// objects, so it does not reintroduce the per-entry object overhead this design is trying to avoid.
+/// Layout: each off-heap record is `recordSize` bytes -- `4 * numKeyColumns` bytes of consecutive int key
+/// columns (offset 0), then the 8-byte double value at the next 8-byte-aligned offset (padding in between
+/// if `4 * numKeyColumns` is not already a multiple of 8). At numKeyColumns=1 this is exactly 16 bytes --
+/// 4-byte int key (offset 0) + 8-byte double value (offset 8) -- the original, unchanged layout. An
+/// on-heap open-addressing index (key -> off-heap slot index) provides O(1) average lookup; this index
+/// itself is small primitive arrays, not boxed objects, so it does not reintroduce the per-entry object
+/// overhead this design is trying to avoid.
 ///
 /// Growth: MemorySegment is fixed-size once allocated. Growing reallocates a bigger segment and copies old
 /// data in; the abandoned old segment is not individually freed (Arena.ofConfined() frees everything at
 /// once on close()) -- this holds some extra native memory DURING a growth event within one table's
 /// lifetime, not a permanent leak, since the whole table is short-lived (one query's combine phase).
 ///
+/// Multi-column keys (added while testing DESIGN.md's "multi-column GROUP BY... not yet tested" scope
+/// item): numKeyColumns > 1 packs that many consecutive int columns into the key region instead of one.
+/// This is a deliberately SEPARATE code path from the original single-column one, not a generalization of
+/// it in place -- upsert(int, double)/keyAt(int) are UNCHANGED (same direct-int-comparison index) so every
+/// performance number measured against them all session stays valid; upsert(int[], double)/keysAt(int)
+/// use a different index instead, keyed by a hash of the composite key rather than the key itself (an
+/// arbitrary number of int columns cannot fit in one on-heap int the way a single column can) -- an
+/// on-heap hash match is then verified against the actual off-heap key bytes before being trusted, to
+/// handle hash collisions correctly. A table is exclusively single-column or multi-column for its whole
+/// lifetime, fixed by numKeyColumns at construction; calling the wrong overload for a table's mode throws
+/// rather than silently corrupting the index (the two modes store incompatible things -- a raw key vs. a
+/// hash -- in the same physical on-heap arrays, so mixing them on one instance is not just unsupported,
+/// it is actively unsafe).
+///
 /// NOTE: caller MUST call close() when done with this table, or the native memory leaks for real --
 /// unlike JVM heap objects, nothing here is garbage collected.
 public class OffHeapGroupTable implements AutoCloseable {
-  private static final long RECORD_SIZE = 16;
   private static final long KEY_OFFSET = 0;
-  private static final long VALUE_OFFSET = 8;
-  private static final int EMPTY_KEY = Integer.MIN_VALUE;
+  private static final int EMPTY_KEY = Integer.MIN_VALUE; // single-column mode sentinel (in _indexKeys)
+  private static final int EMPTY_SLOT = -1; // multi-column mode sentinel (in _indexSlots)
   private static final double MAX_LOAD_FACTOR = 0.7;
 
   private final Arena _arena;
   private final boolean _ownsArena;
+  private final int _numKeyColumns;
+  private final long _valueOffset;
+  private final long _recordSize;
   private MemorySegment _segment;
   private int _dataCapacity;
   private int _size;
 
+  // Single-column mode: _indexKeys[i] holds the raw key, EMPTY_KEY means unoccupied.
+  // Multi-column mode: _indexKeys[i] holds hashKeys(...) of the composite key, EMPTY_SLOT in
+  // _indexSlots[i] means unoccupied (there is no reserved "empty hash" value in that mode).
+  // Both arrays are always allocated and initialized regardless of mode (see constructor) so the two
+  // index implementations below never have to reason about which branch initialized them.
   private int[] _indexKeys;
   private int[] _indexSlots;
   private int _indexCapacity;
   private int _indexSize;
 
-  /// Single-thread-owned table: creates its own confined Arena (JVM-enforced single-thread access,
-  /// matching the original Direction B proposal) and frees it in close(). Existing behavior, unchanged.
+  /// Single-thread-owned, single-column table: creates its own confined Arena (JVM-enforced single-thread
+  /// access, matching the original Direction B proposal) and frees it in close(). Existing behavior, unchanged.
   public OffHeapGroupTable(int initialCapacity) {
-    this(initialCapacity, Arena.ofConfined(), true);
+    this(initialCapacity, 1, Arena.ofConfined(), true);
   }
 
-  /// Shard-owned table: uses an externally-provided Arena instead of creating its own, so multiple
-  /// shards (and the threads that access them, under an external lock -- see ShardedOffHeapGroupTable)
-  /// can share one Arena with one lifecycle. Must be Arena.ofShared() (or otherwise safe for the actual
-  /// access pattern), NOT ofConfined() -- a confined arena only permits access from the thread that
-  /// created it, which would throw for every other thread touching a shared shard. close() on an
-  /// instance built this way does NOT close the arena -- the owner (whoever passed it in) is responsible
-  /// for closing it exactly once, after all sharers are done.
+  /// Shard-owned, single-column table: uses an externally-provided Arena instead of creating its own, so
+  /// multiple shards (and the threads that access them, under an external lock -- see
+  /// ShardedOffHeapGroupTable) can share one Arena with one lifecycle. Must be Arena.ofShared() (or
+  /// otherwise safe for the actual access pattern), NOT ofConfined() -- a confined arena only permits
+  /// access from the thread that created it, which would throw for every other thread touching a shared
+  /// shard. close() on an instance built this way does NOT close the arena -- the owner (whoever passed
+  /// it in) is responsible for closing it exactly once, after all sharers are done.
   public OffHeapGroupTable(int initialCapacity, Arena arena) {
-    this(initialCapacity, arena, false);
+    this(initialCapacity, 1, arena, false);
   }
 
-  private OffHeapGroupTable(int initialCapacity, Arena arena, boolean ownsArena) {
+  /// Shard-owned, multi-column table -- same Arena-sharing contract as the two-arg constructor above,
+  /// with numKeyColumns > 1 consecutive int key columns instead of one. See class Javadoc for why this
+  /// is a strictly separate mode rather than a drop-in generalization of the single-column one.
+  public OffHeapGroupTable(int initialCapacity, int numKeyColumns, Arena arena) {
+    this(initialCapacity, numKeyColumns, arena, false);
+  }
+
+  private OffHeapGroupTable(int initialCapacity, int numKeyColumns, Arena arena, boolean ownsArena) {
+    if (numKeyColumns < 1) {
+      throw new IllegalArgumentException("numKeyColumns must be >= 1, got " + numKeyColumns);
+    }
     _arena = arena;
     _ownsArena = ownsArena;
+    _numKeyColumns = numKeyColumns;
+    long keyBytes = 4L * numKeyColumns;
+    _valueOffset = ((keyBytes + 7) / 8) * 8; // round up to 8-byte alignment for the double
+    _recordSize = _valueOffset + 8;
     _dataCapacity = Math.max(16, initialCapacity);
-    _segment = _arena.allocate(RECORD_SIZE * _dataCapacity, 8);
+    _segment = _arena.allocate(_recordSize * _dataCapacity, 8);
     _size = 0;
 
     _indexCapacity = nextPowerOfTwo(Math.max(16, (int) (_dataCapacity / MAX_LOAD_FACTOR)));
     _indexKeys = new int[_indexCapacity];
-    Arrays.fill(_indexKeys, EMPTY_KEY);
     _indexSlots = new int[_indexCapacity];
+    Arrays.fill(_indexKeys, EMPTY_KEY);
+    Arrays.fill(_indexSlots, EMPTY_SLOT);
     _indexSize = 0;
   }
 
-  /// Upsert: adds `value` to the running aggregate for `key` (SUM semantics), inserting a new record if
-  /// `key` has not been seen before. Returns the key's new aggregated value post-upsert -- callers that
-  /// want to track a concentration signal (e.g. adaptive capacity, see ShardedOffHeapGroupTable) need
-  /// this and would otherwise have to do a second, redundant lookup for it.
+  /// Single-column upsert: adds `value` to the running aggregate for `key` (SUM semantics), inserting a
+  /// new record if `key` has not been seen before. Returns the key's new aggregated value post-upsert --
+  /// callers that want to track a concentration signal (e.g. adaptive capacity, see
+  /// ShardedOffHeapGroupTable) need this and would otherwise have to do a second, redundant lookup for it.
+  /// Only valid on a table constructed with numKeyColumns == 1 -- throws otherwise, since calling this on
+  /// a multi-column table would silently ignore every key column past the first.
   public double upsert(int key, double value) {
+    requireSingleColumn();
     int probe = indexOf(key);
     if (probe >= 0) {
       int slot = _indexSlots[probe];
-      double existing = _segment.get(ValueLayout.JAVA_DOUBLE, slot * RECORD_SIZE + VALUE_OFFSET);
+      double existing = _segment.get(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset);
       double updated = existing + value;
-      _segment.set(ValueLayout.JAVA_DOUBLE, slot * RECORD_SIZE + VALUE_OFFSET, updated);
+      _segment.set(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset, updated);
       return updated;
     }
 
@@ -112,13 +154,44 @@ public class OffHeapGroupTable implements AutoCloseable {
       growData();
     }
     int slot = _size++;
-    _segment.set(ValueLayout.JAVA_INT, slot * RECORD_SIZE + KEY_OFFSET, key);
-    _segment.set(ValueLayout.JAVA_DOUBLE, slot * RECORD_SIZE + VALUE_OFFSET, value);
+    _segment.set(ValueLayout.JAVA_INT, slot * _recordSize + KEY_OFFSET, key);
+    _segment.set(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset, value);
 
     if (_indexSize >= _indexCapacity * MAX_LOAD_FACTOR) {
       growIndex();
     }
     insertIntoIndex(key, slot);
+    return value;
+  }
+
+  /// Multi-column upsert: same SUM semantics and new-composite-key-insertion behavior as the
+  /// single-column upsert above, but keyed by `keys.length` consecutive int columns instead of one. Only
+  /// valid on a table constructed with numKeyColumns > 1 and matching keys.length -- see class Javadoc for
+  /// why single- and multi-column usage cannot be mixed on the same table instance.
+  public double upsert(int[] keys, double value) {
+    requireMultiColumn(keys);
+    int probe = indexOfMulti(keys);
+    if (probe >= 0) {
+      int slot = _indexSlots[probe];
+      double existing = _segment.get(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset);
+      double updated = existing + value;
+      _segment.set(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset, updated);
+      return updated;
+    }
+
+    if (_size >= _dataCapacity) {
+      growData();
+    }
+    int slot = _size++;
+    for (int c = 0; c < _numKeyColumns; c++) {
+      _segment.set(ValueLayout.JAVA_INT, slot * _recordSize + KEY_OFFSET + 4L * c, keys[c]);
+    }
+    _segment.set(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset, value);
+
+    if (_indexSize >= _indexCapacity * MAX_LOAD_FACTOR) {
+      growIndex();
+    }
+    insertHashIntoIndex(hashKeys(keys), slot);
     return value;
   }
 
@@ -136,27 +209,34 @@ public class OffHeapGroupTable implements AutoCloseable {
     double[] values = new double[_size];
     int[] indices = new int[_size];
     for (int i = 0; i < _size; i++) {
-      values[i] = _segment.get(ValueLayout.JAVA_DOUBLE, (long) i * RECORD_SIZE + VALUE_OFFSET);
+      values[i] = _segment.get(ValueLayout.JAVA_DOUBLE, (long) i * _recordSize + _valueOffset);
       indices[i] = i;
     }
     quickSortDescending(values, indices, 0, _size - 1);
 
-    MemorySegment trimmedSegment = _arena.allocate(RECORD_SIZE * topK, 8);
+    MemorySegment trimmedSegment = _arena.allocate(_recordSize * topK, 8);
     for (int newSlot = 0; newSlot < topK; newSlot++) {
       int oldSlot = indices[newSlot];
-      MemorySegment.copy(_segment, (long) oldSlot * RECORD_SIZE, trimmedSegment, (long) newSlot * RECORD_SIZE,
-          RECORD_SIZE);
+      MemorySegment.copy(_segment, (long) oldSlot * _recordSize, trimmedSegment, (long) newSlot * _recordSize,
+          _recordSize);
     }
     _segment = trimmedSegment;
     _dataCapacity = topK;
     _size = topK;
 
     // Rebuild the index to match the new (compacted) slot numbering.
-    Arrays.fill(_indexKeys, EMPTY_KEY);
     _indexSize = 0;
-    for (int slot = 0; slot < _size; slot++) {
-      int key = _segment.get(ValueLayout.JAVA_INT, slot * RECORD_SIZE + KEY_OFFSET);
-      insertIntoIndex(key, slot);
+    if (_numKeyColumns == 1) {
+      Arrays.fill(_indexKeys, EMPTY_KEY);
+      for (int slot = 0; slot < _size; slot++) {
+        int key = _segment.get(ValueLayout.JAVA_INT, slot * _recordSize + KEY_OFFSET);
+        insertIntoIndex(key, slot);
+      }
+    } else {
+      Arrays.fill(_indexSlots, EMPTY_SLOT);
+      for (int slot = 0; slot < _size; slot++) {
+        insertHashIntoIndex(hashKeysAt(slot), slot);
+      }
     }
   }
 
@@ -164,12 +244,31 @@ public class OffHeapGroupTable implements AutoCloseable {
     return _size;
   }
 
+  public int numKeyColumns() {
+    return _numKeyColumns;
+  }
+
+  /// Single-column accessor -- only valid on a numKeyColumns == 1 table, see upsert(int, double).
   public int keyAt(int slot) {
-    return _segment.get(ValueLayout.JAVA_INT, slot * RECORD_SIZE + KEY_OFFSET);
+    requireSingleColumn();
+    return _segment.get(ValueLayout.JAVA_INT, slot * _recordSize + KEY_OFFSET);
+  }
+
+  /// Multi-column accessor -- returns a freshly-allocated array of this table's numKeyColumns values.
+  /// Not on the upsert hot path (called from finishAllShards()'s sub-segment merge and trimTo()'s own
+  /// index rebuild, both already-necessarily-allocating/single-threaded contexts), so the per-call
+  /// allocation is acceptable here in a way it deliberately is not in upsert() itself. Works for any
+  /// numKeyColumns, including 1 -- unlike upsert(), there is no index-corruption hazard in a pure read.
+  public int[] keysAt(int slot) {
+    int[] keys = new int[_numKeyColumns];
+    for (int c = 0; c < _numKeyColumns; c++) {
+      keys[c] = _segment.get(ValueLayout.JAVA_INT, slot * _recordSize + KEY_OFFSET + 4L * c);
+    }
+    return keys;
   }
 
   public double valueAt(int slot) {
-    return _segment.get(ValueLayout.JAVA_DOUBLE, slot * RECORD_SIZE + VALUE_OFFSET);
+    return _segment.get(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset);
   }
 
   @Override
@@ -181,7 +280,9 @@ public class OffHeapGroupTable implements AutoCloseable {
     // owner is responsible for closing it once, after every table sharing it is done.
   }
 
-  // ---------- on-heap open-addressing index (key -> off-heap slot), primitive int[] only ----------
+  // ---------- single-column on-heap index (raw key -> off-heap slot) -- UNCHANGED from the original
+  // single-purpose version of this class; every performance number measured against it all session used
+  // exactly this code. ----------
 
   private int indexOf(int key) {
     int mask = _indexCapacity - 1;
@@ -206,31 +307,117 @@ public class OffHeapGroupTable implements AutoCloseable {
     _indexSize++;
   }
 
+  // ---------- multi-column on-heap index (hash of composite key -> off-heap slot, verified against the
+  // actual off-heap key bytes on hash match to handle collisions correctly) ----------
+
+  private int indexOfMulti(int[] keys) {
+    int mask = _indexCapacity - 1;
+    int keyHash = hashKeys(keys);
+    int i = keyHash & mask;
+    while (_indexSlots[i] != EMPTY_SLOT) {
+      if (_indexKeys[i] == keyHash && keysEqualAt(_indexSlots[i], keys)) {
+        return i;
+      }
+      i = (i + 1) & mask;
+    }
+    return -1;
+  }
+
+  private void insertHashIntoIndex(int keyHash, int slot) {
+    int mask = _indexCapacity - 1;
+    int i = keyHash & mask;
+    while (_indexSlots[i] != EMPTY_SLOT) {
+      i = (i + 1) & mask;
+    }
+    _indexKeys[i] = keyHash;
+    _indexSlots[i] = slot;
+    _indexSize++;
+  }
+
+  private boolean keysEqualAt(int slot, int[] keys) {
+    long base = slot * _recordSize + KEY_OFFSET;
+    for (int c = 0; c < _numKeyColumns; c++) {
+      if (_segment.get(ValueLayout.JAVA_INT, base + 4L * c) != keys[c]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private int hashKeys(int[] keys) {
+    int h = 1;
+    for (int k : keys) {
+      h = h * 31 + k;
+    }
+    return mix(h);
+  }
+
+  private int hashKeysAt(int slot) {
+    long base = slot * _recordSize + KEY_OFFSET;
+    int h = 1;
+    for (int c = 0; c < _numKeyColumns; c++) {
+      h = h * 31 + _segment.get(ValueLayout.JAVA_INT, base + 4L * c);
+    }
+    return mix(h);
+  }
+
+  private void requireSingleColumn() {
+    if (_numKeyColumns != 1) {
+      throw new IllegalStateException(
+          "upsert(int, double) / keyAt(int) require a table constructed with numKeyColumns == 1, this table has "
+              + _numKeyColumns);
+    }
+  }
+
+  private void requireMultiColumn(int[] keys) {
+    if (_numKeyColumns == 1) {
+      throw new IllegalStateException("this table has numKeyColumns == 1 -- use upsert(int, double) instead");
+    }
+    if (keys.length != _numKeyColumns) {
+      throw new IllegalArgumentException("expected " + _numKeyColumns + " key columns, got " + keys.length);
+    }
+  }
+
+  // ---------- shared growth / hashing helpers ----------
+
   private void growIndex() {
     int[] oldKeys = _indexKeys;
     int[] oldSlots = _indexSlots;
     _indexCapacity *= 2;
     _indexKeys = new int[_indexCapacity];
-    Arrays.fill(_indexKeys, EMPTY_KEY);
     _indexSlots = new int[_indexCapacity];
+    Arrays.fill(_indexKeys, EMPTY_KEY);
+    Arrays.fill(_indexSlots, EMPTY_SLOT);
     _indexSize = 0;
-    for (int i = 0; i < oldKeys.length; i++) {
-      if (oldKeys[i] != EMPTY_KEY) {
-        insertIntoIndex(oldKeys[i], oldSlots[i]);
+    if (_numKeyColumns == 1) {
+      for (int i = 0; i < oldKeys.length; i++) {
+        if (oldKeys[i] != EMPTY_KEY) {
+          insertIntoIndex(oldKeys[i], oldSlots[i]);
+        }
+      }
+    } else {
+      for (int i = 0; i < oldSlots.length; i++) {
+        if (oldSlots[i] != EMPTY_SLOT) {
+          insertHashIntoIndex(oldKeys[i], oldSlots[i]); // oldKeys[i] already holds the hash in this mode
+        }
       }
     }
   }
 
   private void growData() {
     int newCapacity = _dataCapacity * 2;
-    MemorySegment newSegment = _arena.allocate(RECORD_SIZE * newCapacity, 8);
-    MemorySegment.copy(_segment, 0, newSegment, 0, RECORD_SIZE * _size);
+    MemorySegment newSegment = _arena.allocate(_recordSize * newCapacity, 8);
+    MemorySegment.copy(_segment, 0, newSegment, 0, _recordSize * _size);
     _segment = newSegment; // old segment is abandoned, freed only when the whole Arena closes -- see class javadoc
     _dataCapacity = newCapacity;
   }
 
   private static int hash(int key) {
-    int h = key * 0x9E3779B1;
+    return mix(key);
+  }
+
+  private static int mix(int h) {
+    h = h * 0x9E3779B1;
     return h ^ (h >>> 16);
   }
 

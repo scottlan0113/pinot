@@ -208,6 +208,122 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   @Test
+  public void testMultiColumnKeyBasicUpsertAndMerge() {
+    // Multi-column counterpart to testBasicUpsertAndMerge (DESIGN.md Sec 4.6's "multi-column GROUP
+    // BY... not yet tested" scope item). Two composite keys sharing one column but differing in the
+    // other must stay separate; the exact same composite key upserted twice must aggregate.
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 16, 16, false, 1, true, 2)) {
+      table.upsert(new int[]{1, 100}, 10d);
+      table.upsert(new int[]{1, 200}, 20d); // same column 0, different column 1 -- must stay separate
+      table.upsert(new int[]{1, 100}, 5d);  // exact same composite key -- must aggregate
+      table.upsert(new int[]{2, 100}, 30d); // different column 0, same column 1 as another row
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), 3);
+
+      Map<List<Integer>, Double> result = new java.util.HashMap<>();
+      table.forEachMultiColumnEntry((keys, value) -> result.put(toList(keys), value));
+      Assert.assertEquals(result.get(List.of(1, 100)), 15d);
+      Assert.assertEquals(result.get(List.of(1, 200)), 20d);
+      Assert.assertEquals(result.get(List.of(2, 100)), 30d);
+    }
+  }
+
+  @Test
+  public void testMultiColumnKeySameCompositeKeyAlwaysRoutesToSameShardAcrossThreads()
+      throws Exception {
+    // Multi-column counterpart to testSameKeyAlwaysRoutesToSameShardAcrossThreads -- shard/sub-segment
+    // routing must hash the FULL composite key consistently regardless of which thread produced a given
+    // upsert, the same guarantee the single-column path already has.
+    int cardinalityPerColumn = 70; // 70*70 = 4900 distinct composite keys, comparable to the single-column test
+    ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+    Map<List<Integer>, Double> groundTruth = new ConcurrentHashMap<>();
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 256, 256, false, 1, true, 2)) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < NUM_THREADS; t++) {
+        long seed = 4000L + t;
+        futures.add(executor.submit(() -> {
+          Random random = new Random(seed);
+          for (int r = 0; r < 20_000; r++) {
+            int[] keys = new int[]{random.nextInt(cardinalityPerColumn), random.nextInt(cardinalityPerColumn)};
+            double value = random.nextDouble() * 100;
+            table.upsert(keys, value);
+            groundTruth.merge(toList(keys), value, Double::sum);
+          }
+        }));
+      }
+      for (Future<?> f : futures) {
+        f.get(30, TimeUnit.SECONDS);
+      }
+      executor.shutdown();
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), groundTruth.size());
+      Map<List<Integer>, Double> result = new java.util.HashMap<>();
+      table.forEachMultiColumnEntry((keys, value) -> result.put(toList(keys), value));
+      for (Map.Entry<List<Integer>, Double> entry : groundTruth.entrySet()) {
+        Assert.assertEquals(result.get(entry.getKey()), entry.getValue(), 1e-6,
+            "Mismatch for composite key " + entry.getKey());
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testMultiColumnKeyWithAdaptiveCapacityAndSubSegments()
+      throws Exception {
+    // Smoke test for the full stack together: multi-column keys + adaptive capacity + sub-segments. The
+    // skew/recall behavior itself is already covered by the single-column adaptive-capacity tests above
+    // -- this only needs to confirm there is no interaction bug when all three are combined (e.g.
+    // hashing the wrong thing for shard vs. sub-segment routing on a composite key, or the
+    // merge-on-finish path picking the wrong upsert overload for a multi-column table).
+    int cardinalityPerColumn = 40;
+    ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+    Map<List<Integer>, Double> groundTruth = new ConcurrentHashMap<>();
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 64, 64, true, 4, true, 2)) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < NUM_THREADS; t++) {
+        long seed = 5000L + t;
+        futures.add(executor.submit(() -> {
+          Random random = new Random(seed);
+          for (int r = 0; r < 20_000; r++) {
+            int[] keys = new int[]{random.nextInt(cardinalityPerColumn), random.nextInt(cardinalityPerColumn)};
+            double value = random.nextDouble() * 100;
+            table.upsert(keys, value);
+            groundTruth.merge(toList(keys), value, Double::sum);
+          }
+        }));
+      }
+      for (Future<?> f : futures) {
+        f.get(30, TimeUnit.SECONDS);
+      }
+      executor.shutdown();
+
+      table.finishAllShards();
+      // Capacity here is small enough that trimming may drop some keys -- unlike the no-trim tests
+      // above, we don't assert full ground-truth coverage, only that every SURVIVING entry is correct.
+      Map<List<Integer>, Double> result = new java.util.HashMap<>();
+      table.forEachMultiColumnEntry((keys, value) -> result.put(toList(keys), value));
+      for (Map.Entry<List<Integer>, Double> entry : result.entrySet()) {
+        Double expected = groundTruth.get(entry.getKey());
+        Assert.assertNotNull(expected, "Result contains a composite key not in ground truth: " + entry.getKey());
+        Assert.assertEquals(entry.getValue(), expected, 1e-6, "Mismatch for composite key " + entry.getKey());
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  private static List<Integer> toList(int[] keys) {
+    List<Integer> list = new ArrayList<>(keys.length);
+    for (int k : keys) {
+      list.add(k);
+    }
+    return list;
+  }
+
+  @Test
   public void testAdaptiveCapacityWithSubSegmentsShrinksOnSkewedData()
       throws Exception {
     // Sub-segmenting was extended to adaptive capacity (§6.2) by moving the top1Share signal

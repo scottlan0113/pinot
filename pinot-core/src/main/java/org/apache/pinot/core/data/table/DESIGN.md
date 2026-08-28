@@ -1046,6 +1046,63 @@ the sub-segmenting win.
   across shards, same as Direction A) — worth stating explicitly since it's easy to
   incorrectly assume Direction B's duplication numbers (§5.5) carry over.
 
+### 6.7 Multi-column GROUP BY (2026-08-28)
+
+Closes the "multi-column GROUP BY is architecturally expected to work... but has not been
+tested" gap this document has carried since §4.6 — for Direction A that gap was about testing
+an already-general mechanism (real Pinot `Record`/`Key` classes support arbitrary schemas);
+Direction C's `OffHeapGroupTable`/`ShardedOffHeapGroupTable` are hand-rolled prototypes that
+hard-coded a single int key column, so this required real implementation work, not just a new
+test against existing code.
+
+**Design**: `numKeyColumns > 1` packs that many consecutive int columns into the off-heap key
+region instead of one, via a **deliberately separate** code path from the original
+single-column one — `upsert(int, double)`/`keyAt(int)` are byte-for-byte unchanged, so every
+performance number in §6.4/§6.5 stays valid; `upsert(int[], double)`/`keysAt(int)` are new,
+backed by a different on-heap index (stores a hash of the composite key rather than the key
+itself, verified against the actual off-heap key bytes on a hash match to handle collisions
+correctly — an arbitrary number of int columns cannot fit in one on-heap `int` the way a
+single column can). A table is exclusively one mode or the other for its whole lifetime, and
+calling the wrong overload throws rather than silently corrupting the index, since the two
+modes store incompatible things in the same physical on-heap arrays. Shard and sub-segment
+routing (`shardForMulti`/`subSegmentForMulti`) hash the full composite key, mirroring the
+existing single-column routing's raw-hash-for-shard / avalanche-mix-for-sub-segment
+decorrelation. Adaptive capacity's `top1Share` signal needed no changes at all — it only ever
+looks at values, never keys.
+
+**Verification**: three new tests in `ShardedOffHeapGroupTableTest.java` —
+`testMultiColumnKeyBasicUpsertAndMerge` (composite keys sharing one column but differing in
+another stay separate; the exact same composite key merges),
+`testMultiColumnKeySameCompositeKeyAlwaysRoutesToSameShardAcrossThreads` (concurrency,
+mirroring the single-column routing test), and
+`testMultiColumnKeyWithAdaptiveCapacityAndSubSegments` (a combined smoke test for multi-column
++ adaptive capacity + sub-segments together, since none of those three were tested in
+combination before). All 12 tests in the suite (9 pre-existing + 3 new) verified clean across
+9 separate runs (4 full-suite, 5 targeted at just the 3 new tests) — no flakiness, and no
+regression to any pre-existing single-column behavior.
+
+**Scope limit, not yet addressed**: still int-only columns, matching this whole prototype's
+existing int-key/double-value scope (§6, opening paragraph). Real Pinot GROUP BY keys are
+often STRING or a mix of types — supporting that would mean either a variable-length off-heap
+key encoding (a materially harder problem than fixed-width composite int keys) or switching
+this prototype onto Pinot's real `Record`/`Key`/`DataSchema` classes, which is really the same
+work as query-engine wiring (§6.6) rather than a separate item worth solving in isolation
+first.
+
+**Tangential finding, NOT fixed**: designing the multi-column index's empty-slot sentinel
+surfaced a latent bug in the *original* single-column index, unrelated to this session's own
+changes — `indexOf`/`insertIntoIndex` use `Integer.MIN_VALUE` as the "this slot is empty"
+sentinel stored directly in `_indexKeys`, so a real GROUP BY key of exactly
+`Integer.MIN_VALUE` would never be found after insertion (the lookup loop's
+`_indexKeys[i] != EMPTY_KEY` check treats that occupied slot as if it were empty). Extremely
+edge-case (requires a key exactly equal to `-2147483648`) and does not affect any benchmark or
+test run so far, none of which use that value — left as-is rather than fixed, since fixing it
+was not part of what multi-column support required (the new multi-column index already avoids
+this failure mode entirely, via a dedicated `_indexSlots`-based occupancy check rather than a
+reserved sentinel value) and touching the single-column path at all risks the performance
+numbers §6.4/§8 depend on staying exactly reproducible. Flagged for a decision the same way
+the Direction A gate bug was (§4.6), not silently patched.
+
 ## 7. Recommendation: Direction C
 
 Per Jackie's explicit request to weigh all three directions and reach a recommendation through
