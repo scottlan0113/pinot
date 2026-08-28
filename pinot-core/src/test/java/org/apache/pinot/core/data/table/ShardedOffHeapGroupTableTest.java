@@ -162,6 +162,61 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   @Test
+  public void testSubSegmentsUnderRealConcurrentThreads()
+      throws Exception {
+    // Splitting each outer shard into numSubSegments independently-locked sub-segments (§6.2's
+    // sub-segment attempt) must still be exactly correct: every key's aggregated value must match
+    // ground truth, and finishAllShards()'s merge-then-trim step must not lose or duplicate anything
+    // when consolidating sub-segments 1..N-1 into sub-segment 0.
+    int cardinality = 5000;
+    int numSubSegments = 4;
+    ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+    Map<Integer, Double> groundTruth = new ConcurrentHashMap<>();
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 256, Integer.MAX_VALUE,
+        false, numSubSegments)) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < NUM_THREADS; t++) {
+        long seed = 3000L + t;
+        futures.add(executor.submit(() -> {
+          Random random = new Random(seed);
+          for (int r = 0; r < 50_000; r++) {
+            int key = random.nextInt(cardinality);
+            double value = random.nextDouble() * 100;
+            table.upsert(key, value);
+            groundTruth.merge(key, value, Double::sum);
+          }
+        }));
+      }
+      for (Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+      executor.shutdown();
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), groundTruth.size(), "Expected every key to survive (no "
+          + "trim at this capacity); a mismatch here would mean the sub-segment merge lost or "
+          + "duplicated a key");
+      Map<Integer, Double> result = new java.util.HashMap<>();
+      table.forEachEntry(result::put);
+      for (Map.Entry<Integer, Double> entry : groundTruth.entrySet()) {
+        Assert.assertEquals(result.get(entry.getKey()), entry.getValue(), 1e-6,
+            "Mismatch for key " + entry.getKey() + " -- lost or double-counted update across sub-segments");
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test(expectedExceptions = IllegalArgumentException.class)
+  public void testSubSegmentsRejectedForAdaptiveCapacity() {
+    // Sub-segmenting is deliberately not extended to adaptive capacity yet (§6.2) -- the top1Share
+    // signal is tracked per OUTER shard and isn't safe to split across independently-locked
+    // sub-segments without its own concurrency treatment. Must fail loudly, not silently do the
+    // wrong thing.
+    new ShardedOffHeapGroupTable(NUM_SHARDS, 16, 5000, true, 4);
+  }
+
+  @Test
   public void testAdaptiveCapacityNoFalsePositiveOnUniformData()
       throws Exception {
     // Regression case for both historical gate bugs: with keys AND values both effectively uniform

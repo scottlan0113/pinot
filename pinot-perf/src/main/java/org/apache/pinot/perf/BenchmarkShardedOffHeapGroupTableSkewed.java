@@ -59,6 +59,12 @@ import org.openjdk.jmh.runner.options.TimeValue;
 /// `random.nextDouble() * 100`) specifically to match `VerifyAdaptiveDirectionC.java`'s own workload
 /// exactly, so the shrinkage this benchmark exercises is a known, already-validated quantity rather
 /// than an untested combination of skewed keys with random values.
+///
+/// `shardedOffHeapGroupTableFixedSubSegmented` measures the sub-segmenting idea (DESIGN.md Sec 6.2):
+/// each outer shard split into NUM_SUB_SEGMENTS independently-locked pieces, keeping the exact
+/// exclusive-lock-per-critical-section model that beat the read-lock fast path, just at finer
+/// granularity -- against `shardedOffHeapGroupTableFixed` (NUM_SUB_SEGMENTS=1, unchanged) as the
+/// direct baseline.
 @State(Scope.Benchmark)
 public class BenchmarkShardedOffHeapGroupTableSkewed {
   private static final int TRIM_SIZE = 5000;
@@ -68,6 +74,7 @@ public class BenchmarkShardedOffHeapGroupTableSkewed {
   private static final int NUM_SEGMENTS = 10;
   private static final int CARDINALITY = 1_000_000;
   private static final double SKEW = 1.0;
+  private static final int NUM_SUB_SEGMENTS = 4;
 
   private QueryContext _queryContext;
   private DataSchema _dataSchema;
@@ -168,6 +175,17 @@ public class BenchmarkShardedOffHeapGroupTableSkewed {
       throws InterruptedException {
     try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
         TRIM_SIZE, true)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, NUM_SUB_SEGMENTS)) {
       runDirectionC(table);
     }
   }

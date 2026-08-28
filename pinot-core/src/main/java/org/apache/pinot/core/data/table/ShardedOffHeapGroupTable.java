@@ -49,6 +49,21 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// The write-lock-for-every-upsert design here is not an unexamined default; it was compared directly
 /// against a more fine-grained alternative and won.
 ///
+/// Sub-segmenting (fixed capacity only): each outer shard can optionally be split into
+/// `numSubSegments` independently-locked OffHeapGroupTable instances instead of one. This keeps the
+/// exact same exclusive-lock-per-critical-section model that beat the read-lock fast path above --
+/// resize is still always safely inside a normal write lock, no new correctness hazard -- just at
+/// finer granularity, so keys hashing to the same OUTER shard but different sub-segments no longer
+/// contend. Deliberately NOT extended to adaptive capacity yet: the top1Share signal is tracked per
+/// OUTER shard specifically to avoid multiplying the memory-ceiling problem (Sec 4.2) that more outer
+/// shards would cause, and splitting the signal-tracking fields across multiple independently-locked
+/// sub-segments needs its own concurrency-safety treatment (DoubleAdder/LongAdder/CAS-based max,
+/// mirroring AdaptiveConcurrentIndexedTable) that hasn't been done -- passing numSubSegments>1 with
+/// adaptiveCapacity=true throws rather than silently doing the wrong thing. finishAllShards() merges
+/// all of a shard's sub-segments into sub-segment 0 (single-threaded at that point, reusing
+/// OffHeapGroupTable's own upsert()) before trimming, so totalSize()/forEachEntry() only ever need to
+/// look at sub-segment 0 per shard -- consistent whether numSubSegments is 1 or more.
+///
 /// Arena lifecycle: one Arena.ofShared() (NOT ofConfined() -- confined arenas restrict access to their
 /// creating thread, which would throw for every other thread touching a shared shard) backs every
 /// shard's memory. close() closes it once, freeing every shard's memory together.
@@ -69,13 +84,14 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   private static final long MIN_SAMPLES_BEFORE_ADAPTATION = 5000;
 
   private final int _numShards;
+  private final int _numSubSegments;
   private final boolean _adaptiveCapacity;
   private final int _fullCapacity;
   private final int _mediumCapacity;
   private final int _smallCapacity;
   private final Arena _arena;
-  private final OffHeapGroupTable[] _shards;
-  private final ReentrantReadWriteLock[] _locks;
+  private final OffHeapGroupTable[][] _shards; // [outer shard][sub-segment]
+  private final ReentrantReadWriteLock[][] _locks; // [outer shard][sub-segment]
 
   // Adaptive-capacity bookkeeping, one slot per shard. Plain arrays, not atomics: every write happens
   // under that shard's write lock already (see upsert()), so there is no separate race to guard against.
@@ -90,7 +106,7 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   private final int[] _currentTier; // 0 = full, 1 = medium, 2 = small; monotonic, only ever increases
 
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity) {
-    this(numShards, perShardInitialCapacity, perShardInitialCapacity, false);
+    this(numShards, perShardInitialCapacity, perShardInitialCapacity, false, 1);
   }
 
   /// @param fullCapacity     Per-shard capacity used when adaptiveCapacity is false, or as the FULL tier
@@ -103,21 +119,36 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   ///                         a ConcurrentIndexedTable one.
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
       boolean adaptiveCapacity) {
+    this(numShards, perShardInitialCapacity, fullCapacity, adaptiveCapacity, 1);
+  }
+
+  /// @param numSubSegments Splits each outer shard into this many independently-locked sub-segments
+  ///                        (see class Javadoc). 1 = existing behavior exactly. Only valid with
+  ///                        adaptiveCapacity=false.
+  public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
+      boolean adaptiveCapacity, int numSubSegments) {
+    if (adaptiveCapacity && numSubSegments > 1) {
+      throw new IllegalArgumentException("Sub-segmenting is not yet supported for adaptive capacity");
+    }
     _numShards = numShards;
+    _numSubSegments = numSubSegments;
     _adaptiveCapacity = adaptiveCapacity;
     _fullCapacity = fullCapacity;
     _mediumCapacity = Math.max(1, fullCapacity / 10);
     _smallCapacity = Math.max(1, fullCapacity / 100);
     _arena = Arena.ofShared();
-    _shards = new OffHeapGroupTable[numShards];
-    _locks = new ReentrantReadWriteLock[numShards];
+    _shards = new OffHeapGroupTable[numShards][numSubSegments];
+    _locks = new ReentrantReadWriteLock[numShards][numSubSegments];
     _runningMax = new double[numShards];
     _runningTotal = new double[numShards];
     _sampleCount = new long[numShards];
     _currentTier = new int[numShards];
+    int perSubSegmentInitialCapacity = Math.max(1, perShardInitialCapacity / numSubSegments);
     for (int i = 0; i < numShards; i++) {
-      _shards[i] = new OffHeapGroupTable(perShardInitialCapacity, _arena);
-      _locks[i] = new ReentrantReadWriteLock();
+      for (int j = 0; j < numSubSegments; j++) {
+        _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, _arena);
+        _locks[i][j] = new ReentrantReadWriteLock();
+      }
     }
   }
 
@@ -125,15 +156,32 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
     return Math.floorMod(Integer.hashCode(key), _numShards);
   }
 
-  /// Thread-safe: takes the target shard's write lock for the full duration of the upsert. Safe to call
-  /// concurrently from multiple threads on the same table (that's the whole point) -- different keys
-  /// hashing to different shards proceed fully in parallel; keys hashing to the same shard serialize.
+  /// A second, independent hash for sub-segment selection -- Integer.hashCode(int) is just the int
+  /// itself, so shardFor() is really `key mod numShards`. Reusing that same raw value (mod
+  /// numSubSegments) for sub-segment selection would correlate the two choices (e.g. every key that's
+  /// a multiple of numShards would also land in the same sub-segment). The multiplicative mixing
+  /// constant here is the same one OffHeapGroupTable's own index hash() already uses -- a proven
+  /// avalanche mix, not a new unverified choice.
+  private int subSegmentFor(int key) {
+    if (_numSubSegments == 1) {
+      return 0;
+    }
+    int h = key * 0x9E3779B1;
+    h ^= h >>> 16;
+    return Math.floorMod(h, _numSubSegments);
+  }
+
+  /// Thread-safe: takes the target shard's (and sub-segment's) write lock for the full duration of the
+  /// upsert. Safe to call concurrently from multiple threads on the same table (that's the whole point)
+  /// -- different keys hashing to different shards, or to different sub-segments of the same shard,
+  /// proceed fully in parallel; keys hashing to the same shard AND sub-segment serialize.
   public void upsert(int key, double value) {
     int shard = shardFor(key);
-    ReentrantReadWriteLock lock = _locks[shard];
+    int subSegment = subSegmentFor(key);
+    ReentrantReadWriteLock lock = _locks[shard][subSegment];
     lock.writeLock().lock();
     try {
-      double updatedValue = _shards[shard].upsert(key, value);
+      double updatedValue = _shards[shard][subSegment].upsert(key, value);
       if (_adaptiveCapacity) {
         updateSignal(shard, value, updatedValue);
       }
@@ -181,36 +229,56 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
 
   /// Trims every shard down to its capacity (fixed at fullCapacity, or per-shard-adaptive if this table
   /// was built with adaptiveCapacity=true), matching finish() semantics (called once, after all upserts
-  /// are done, not continuously). Sequential across shards for this first prototype -- could be
-  /// parallelized (matching ShardedIndexedTable.finishShardsInParallel) but that is a performance
-  /// refinement, not needed to validate correctness first.
+  /// are done, not continuously). If numSubSegments > 1, every sub-segment beyond the first is merged
+  /// into sub-segment 0 first (single-threaded at this point -- all locks for the shard are held for
+  /// the duration -- so OffHeapGroupTable's own upsert() is safe to reuse directly rather than writing
+  /// new merge logic), then that merged sub-segment 0 is trimmed exactly as the single-sub-segment case
+  /// always was. Sequential across shards for this first prototype -- could be parallelized (matching
+  /// ShardedIndexedTable.finishShardsInParallel) but that is a performance refinement, not needed to
+  /// validate correctness first.
   public void finishAllShards() {
     for (int i = 0; i < _numShards; i++) {
-      ReentrantReadWriteLock lock = _locks[i];
-      lock.writeLock().lock();
+      for (int j = 0; j < _numSubSegments; j++) {
+        _locks[i][j].writeLock().lock();
+      }
       try {
-        _shards[i].trimTo(capacityFor(i));
+        OffHeapGroupTable primary = _shards[i][0];
+        for (int j = 1; j < _numSubSegments; j++) {
+          OffHeapGroupTable other = _shards[i][j];
+          int size = other.size();
+          for (int k = 0; k < size; k++) {
+            primary.upsert(other.keyAt(k), other.valueAt(k));
+          }
+        }
+        primary.trimTo(capacityFor(i));
       } finally {
-        lock.writeLock().unlock();
+        for (int j = 0; j < _numSubSegments; j++) {
+          _locks[i][j].writeLock().unlock();
+        }
       }
     }
   }
 
+  /// Valid post-finishAllShards() only -- see forEachEntry().
   public int totalSize() {
     int total = 0;
-    for (OffHeapGroupTable shard : _shards) {
-      total += shard.size();
+    for (OffHeapGroupTable[] shard : _shards) {
+      total += shard[0].size(); // finishAllShards() has already merged every sub-segment into [0]
     }
     return total;
   }
 
-  /// Visits every surviving (key, value) pair across all shards, post-finishAllShards(). No lock taken --
-  /// caller must ensure no concurrent upserts are in flight (matches finish()-then-read usage pattern).
+  /// Visits every surviving (key, value) pair across all shards, post-finishAllShards() -- by that
+  /// point every shard's sub-segments have been merged into sub-segment 0 (see finishAllShards()), so
+  /// only [0] needs visiting; before finishAllShards() has run, a shard's true contents are split
+  /// across all its sub-segments and this would silently under-report. No lock taken -- caller must
+  /// ensure no concurrent upserts are in flight (matches finish()-then-read usage pattern).
   public void forEachEntry(EntryVisitor visitor) {
-    for (OffHeapGroupTable shard : _shards) {
-      int size = shard.size();
+    for (OffHeapGroupTable[] shard : _shards) {
+      OffHeapGroupTable merged = shard[0];
+      int size = merged.size();
       for (int i = 0; i < size; i++) {
-        visitor.visit(shard.keyAt(i), shard.valueAt(i));
+        visitor.visit(merged.keyAt(i), merged.valueAt(i));
       }
     }
   }

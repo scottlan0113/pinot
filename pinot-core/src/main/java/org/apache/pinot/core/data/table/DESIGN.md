@@ -555,6 +555,53 @@ even though the attempt it was found inside was reverted: anyone reaching for `V
 atomics on off-heap `double` values in a future attempt should use `compareAndSet`, not
 `getAndAdd`, from the start.
 
+**Third attempt, sub-segmenting: kept the exact locking model that beat the fast path, changed
+the granularity instead — this one worked.** Asked what an experienced concurrent-systems
+engineer would try next (given the read-lock fast path's failure mode was specifically
+`ReentrantReadWriteLock`'s own overhead, not the idea of finer granularity in general): split
+each OUTER shard into `numSubSegments` independently-locked `OffHeapGroupTable` instances
+instead of one, keeping the *exact same* exclusive-write-lock-for-every-upsert model that was
+just measured to beat the alternative — no new correctness hazard, since resize is still always
+safely inside a normal write lock, just scoped to a smaller sub-segment. `numSubSegments=1`
+(the default, via two new overloaded constructors) is byte-identical in behavior to before.
+Deliberately scoped to fixed capacity only, same reasoning as the fast-path attempt: the
+`top1Share` signal is tracked per OUTER shard specifically to avoid multiplying the memory-
+ceiling problem (§4.2) that more outer shards would cause, and splitting that signal tracking
+across independently-locked sub-segments needs its own concurrency-safety treatment not yet
+done — `numSubSegments>1` with `adaptiveCapacity=true` throws rather than silently doing the
+wrong thing.
+
+`finishAllShards()` merges every shard's sub-segments 1..N-1 into sub-segment 0 (single-
+threaded at that point, holding every sub-segment's lock — reuses `OffHeapGroupTable.upsert()`
+directly rather than new merge logic) before trimming; `totalSize()`/`forEachEntry()`
+correspondingly only need to look at sub-segment 0 per shard once `finishAllShards()` has run.
+
+Verified correctness first, same discipline as the fast-path attempt: two new tests
+(`testSubSegmentsUnderRealConcurrentThreads` — real concurrent threads, `numSubSegments=4`,
+cross-checked against ground truth, specifically exercises the merge-at-finish path;
+`testSubSegmentsRejectedForAdaptiveCapacity` — the guard throws as documented), plus the
+existing suite re-verified at the `numSubSegments=1` default. 18 total clean runs (15 ad-hoc +
+3 through real `mvn test`) before performance was measured.
+
+Then measured performance on the skewed benchmark (`numSubSegments=4`,
+`shardedOffHeapGroupTableFixedSubSegmented` vs. the existing `shardedOffHeapGroupTableFixed`).
+First run had a single-iteration outlier in the *baseline* (`shardedOffHeapGroupTableFixed`
+Fork 3: one iteration at 52,528 us/op against a tight 44,959-45,404 band everywhere else) —
+not trusted, rerun. Second run clean on every fork of every benchmark:
+
+| Benchmark | Score (avgt, us/op) | vs. Direction A |
+|---|---|---|
+| Direction A | 95,857.789 ± 2,630.367 | baseline |
+| Fixed (`numSubSegments=1`) | 45,594.705 ± 250.722 | 2.10x faster |
+| **Fixed, sub-segmented (`numSubSegments=4`)** | **42,181.160 ± 458.286** | **2.27x faster** |
+
+Sub-segmenting is **8.1% faster than plain fixed capacity** in this run, **6.9% faster** in the
+first (outlier-excluded) run — consistent direction and magnitude across both. This is the
+first of three optimization attempts in this section that actually helped. Kept: the new
+5-argument constructor is purely additive (existing 2- and 4-argument constructors delegate to
+`numSubSegments=1`, unchanged behavior), so nothing about this needed reverting the way the
+first two attempts did.
+
 ### 6.3 Correctness: real concurrent threads, not simulation
 
 Every Direction B measurement (§5) used *simulated* per-thread tables — one thread at a time,
@@ -823,9 +870,14 @@ many more shards) has not been tried and could plausibly need a smaller constant
   read-write-split fast path was built, verified correct (28 clean concurrency runs), and
   measured to REGRESS performance (43,723 -> 48,463 -> 51,087 us/op) — `ReentrantReadWriteLock`'s
   read-side `ThreadLocal` bookkeeping costs more than the write lock saves for a critical section
-  this short (§6.2). Reverted. A lock-free scheme (no `ReentrantReadWriteLock` at all, pure CAS
-  with a different mechanism for the insert-vs-update race) is a different, unexplored idea that
-  wouldn't carry this specific overhead — not tried, no evidence either way.
+  this short (§6.2). Reverted. Sub-segmenting each outer shard (still exclusive locks throughout,
+  just finer-grained) was tried next and DID help — fixed capacity with `numSubSegments=4` is
+  6.9-8.1% faster than `numSubSegments=1` across two clean runs (§6.2) — kept, not reverted. Not
+  yet tried: whether a larger `numSubSegments` (8, 16, ...) helps further or where the returns
+  flatten out; a fully lock-free scheme (no `ReentrantReadWriteLock` at all) remains a different,
+  unexplored, higher-risk idea that a design-phase review (not yet an implementation attempt)
+  found a real correctness hazard in around concurrent resize — see the session notes for the
+  reasoning; not pursued given sub-segmenting already delivered a real win at much lower risk.
 - Not wired into the query engine (same as both parent directions). A regression test suite now
   exists (`ShardedOffHeapGroupTableTest.java`, `pinot-core/src/test/java/org/apache/pinot/core/
   data/table/`) covering basic correctness, same-key-same-shard routing under real concurrent
@@ -843,7 +895,7 @@ characterized on real implementations across the same three axes:
 
 | | A: sharding + adaptive capacity | B: per-thread + off-heap | C: sharding + off-heap |
 |---|---|---|---|
-| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed under both uniform and skewed workloads: fixed capacity 1.81-2.18x faster, adaptive capacity 1.09-1.95x faster (wider margin under the skew #10498 targets) + ~0 GC vs. Direction A itself (§6.4) |
+| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed under both uniform and skewed workloads: fixed capacity 1.81-2.27x faster (2.27x with sub-segmenting, §6.2), adaptive capacity 1.09-1.95x faster (wider margin under the skew #10498 targets) + ~0 GC vs. Direction A itself (§6.4) |
 | Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
 | Correctness risk | None found (§4.5) | Real: recall@10 drops to 62-92% at mild skew (§5.7), unmitigated | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3) |
 | Wired into query engine | No (§4.6) | No (§5.8) | No (§6.6) |
@@ -866,9 +918,11 @@ as a complete design, Direction B carries a correctness risk that Direction C do
 was (in this comparison) *better* performance, not worse — which weakens the case for choosing
 plain Direction B over Direction C specifically. The write-lock-per-upsert design (§6.2) is also
 no longer just an unexamined simplification — it was directly compared against a finer-grained
-read-write-split alternative and won, so the numbers above reflect a design that was tested
-against its own obvious alternative, not merely the first thing that worked. Next step is
-Jackie's input on which direction(s) to keep pursuing — most plausibly Direction C, with
+read-write-split alternative and won, then improved further (not just defended) by
+sub-segmenting each shard while keeping that same exclusive-lock model, a real 6.9-8.1% win.
+The numbers above reflect a design that was tested against its own obvious alternatives, not
+merely the first thing that worked. Next step is Jackie's input on which direction(s) to keep
+pursuing — most plausibly Direction C, with
 query-engine wiring as the concrete remaining work before it's ready to compare against
 Direction A on fully equal footing.
 
@@ -909,6 +963,15 @@ first four instances: those all caught an unrigorous number being *wrong*; this 
 rigorously-measured number was simply *bad news*, and the discipline was to trust it and revert
 rather than look for a reason to keep the change.
 
+A sixth instance, on the sub-segmenting attempt (§6.2) that finally did help: the first run's
+*baseline* (`shardedOffHeapGroupTableFixed`, unmodified code, `numSubSegments=1`) had a single
+iteration spike to 52,528 us/op inside an otherwise tight Fork 3 (44,959-45,404 everywhere else
+in that fork). A less careful read would have compared the new variant against this inflated
+baseline and reported an even bigger win than real — overclaiming in the *flattering* direction,
+which is easier to miss than a suspicious result, precisely because it doesn't trigger the same
+"wait, that's odd" reaction. Caught the same way as every other instance: checking individual
+fork/iteration data, not the aggregate line, before trusting a comparison in either direction.
+
 ## 9. References
 
 - [apache/pinot#10498](https://github.com/apache/pinot/issues/10498)
@@ -928,7 +991,8 @@ rather than look for a reason to keep the change.
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedOffHeapGroupTable.java`
   (Direction A vs. C JMH benchmark, uniform-key workload, §6.4's follow-up)
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedOffHeapGroupTableSkewed.java`
-  (Direction A vs. C JMH benchmark, skewed-key workload, §6.4's skewed follow-up)
+  (Direction A vs. C JMH benchmark, skewed-key workload, §6.4's skewed follow-up; also the
+  sub-segmenting benchmark, §6.2)
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedOffHeapGroupTableSingleThread.java`
   (isolates adaptive capacity's per-upsert cost from lock contention, §6.4's profiling follow-up)
 - `pinot-core/src/test/java/org/apache/pinot/core/data/table/ShardedOffHeapGroupTableTest.java`
