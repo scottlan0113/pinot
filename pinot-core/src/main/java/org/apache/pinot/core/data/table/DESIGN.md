@@ -232,6 +232,21 @@ keeping full capacity per shard in the first place (§4.2).
   `ShardedIndexedTable`.
 - No regression test suite yet — verification so far is ad-hoc scratch scripts, not
   committed tests. This should exist before proposing a real PR.
+- **Found 2026-08-27, NOT yet fixed, NOT yet confirmed against a realistic-value workload**:
+  `AdaptiveConcurrentIndexedTable`'s minimum-sample gate (`updateSignalAndMaybeShrink`) checks
+  `_runningTotal.sum() < MIN_SAMPLES_BEFORE_ADAPTATION` — comparing a **sum** of upserted
+  values against a **sample-count**-shaped threshold. This is the identical bug class Direction
+  C's own port of this signal had (§6.5), fixed there with an explicit sample counter separate
+  from the value sum. Every verification in §4.5 above used a workload where this coincidentally
+  doesn't matter (found by code inspection while researching precedent for Direction C's
+  adaptive-capacity sub-segment port, not by re-running Direction A's own tests with a
+  non-unit-valued workload — that confirmation step hasn't been done). If confirmed, this would
+  mean the memory-reduction and recall numbers in §4.5 need re-verification under a realistic
+  (non-1.0-valued) workload before being relied on as-is, the same way Direction C's original
+  numbers needed re-verification after this bug class was found there. Not fixed here yet —
+  flagged for a decision (fix now vs. defer) rather than silently patched, since §4.5's numbers
+  have already been reported externally and a fix would need those claims revisited, not just
+  the code.
 
 ## 5. Direction B: per-thread tables + off-heap (initial prototype)
 
