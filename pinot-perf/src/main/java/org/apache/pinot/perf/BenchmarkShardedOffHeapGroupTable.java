@@ -147,6 +147,32 @@ public class BenchmarkShardedOffHeapGroupTable {
     }
   }
 
+  /// Sub-segmenting (DESIGN.md Sec 6.2) was only measured on the skewed benchmark before this --
+  /// numSubSegments=4 was a real win there for both fixed and adaptive capacity, but that says nothing
+  /// about a workload where contention is spread over CARDINALITY=50,000 uniformly distinct keys rather
+  /// than concentrated by skew. These two variants close that gap.
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented4()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 4)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableAdaptiveSubSegmented4()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, true, 4)) {
+      runDirectionC(table);
+    }
+  }
+
   private void runDirectionC(ShardedOffHeapGroupTable table)
       throws InterruptedException {
     CountDownLatch operatorLatch = new CountDownLatch(NUM_SEGMENTS);

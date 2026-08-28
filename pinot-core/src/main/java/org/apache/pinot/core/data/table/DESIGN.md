@@ -665,6 +665,28 @@ load rather than an even division) — not attempted here, this investigation st
 learning the over-allocation cost is real and large enough to dominate whatever it was mixed
 with.
 
+**Sub-segmenting on the uniform workload, closing the last gap in this story.** Every
+sub-segmenting result above was measured on the skewed benchmark; the uniform-key benchmark
+(`BenchmarkShardedOffHeapGroupTable`, cardinality 50,000, no skew) had never been checked, so it
+was unknown whether `numSubSegments=4` might help under skew specifically and do nothing (or
+hurt) when contention is spread evenly instead of concentrated. Added
+`shardedOffHeapGroupTableFixedSubSegmented4`/`AdaptiveSubSegmented4` there. Clean on every fork
+of all 4 relevant benchmarks (no outliers, unusually tight even by this document's standards):
+
+| Benchmark | `numSubSegments=1` | `numSubSegments=4` | Improvement |
+|---|---|---|---|
+| Fixed | 24,804.061 ± 285.126 | 14,911.970 ± 330.486 | **66.3% faster** |
+| Adaptive | 54,765.603 ± 334.866 | 37,855.017 ± 202.076 | **44.7% faster** |
+
+Far larger than the skewed workload's 6.3-8.1% — not a smaller or absent effect, a much bigger
+one. Plausible reason: uniform data spreads ~781 keys evenly across every one of the 64 shards,
+so all 64 benefit from finer-grained locking roughly equally; skewed data concentrates traffic
+onto a handful of genuinely hot shards, while many others were already low-contention even at
+`numSubSegments=1`, diluting the aggregate win. Not confirmed by profiling — a reasoned
+explanation consistent with the numbers, not a measured mechanism. Net: sub-segmenting has now
+been checked on both workload shapes this document uses throughout, and helps substantially in
+both — `numSubSegments=4` is not a skew-specific trick.
+
 ### 6.3 Correctness: real concurrent threads, not simulation
 
 Every Direction B measurement (§5) used *simulated* per-thread tables — one thread at a time,
@@ -1032,7 +1054,7 @@ characterized on real implementations across the same three axes:
 
 | | A: sharding + adaptive capacity | B: per-thread + off-heap | C: sharding + off-heap |
 |---|---|---|---|
-| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed under both uniform and skewed workloads: fixed capacity 1.81-2.27x faster (2.27x with sub-segmenting, §6.2), adaptive capacity 1.09-1.95x faster (wider margin under the skew #10498 targets) + ~0 GC vs. Direction A itself (§6.4) |
+| Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed under both uniform and skewed workloads: fixed capacity 1.81-3.00x faster (3.00x with sub-segmenting on uniform data, its biggest measured margin, §6.2), adaptive capacity 1.09-1.95x faster (wider margin under the skew #10498 targets) + ~0 GC vs. Direction A itself (§6.4) |
 | Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
 | Correctness risk | None found (§4.5) | Real: recall@10 drops to 62-92% at mild skew (§5.7), unmitigated | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3) |
 | Wired into query engine | No (§4.6) | No (§5.8) | No (§6.6) |
