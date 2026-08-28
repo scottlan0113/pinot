@@ -1213,6 +1213,19 @@ combination before). All 12 tests in the suite (9 pre-existing + 3 new) verified
 9 separate runs (4 full-suite, 5 targeted at just the 3 new tests) — no flakiness, and no
 regression to any pre-existing single-column behavior.
 
+**Performance re-verified 2026-08-28** (initially argued from "the method is byte-for-byte
+unchanged," not measured — the same gap later caught and closed for the AggregationType change
+in §6.8, so closed here too for consistency rather than left resting on code inspection alone).
+The AggregationType worktree comparison in §6.8 used `2b9e363` (multi-column already merged) as
+its "before" commit, which isolates AggregationType's own effect but does NOT by itself prove
+multi-column had no effect — both sides of that comparison already had it. A dedicated
+`2cc1d89` (before multi-column) vs. `2b9e363` (after) comparison, same
+`BenchmarkShardedOffHeapGroupTableSingleThread` methodology: `fixedSingleThread` 19,326.8 ->
+19,437.2 us/op (+0.57%), `adaptiveSingleThread` 24,572.1 -> 24,437.3 us/op (-0.55%) — both
+comfortably inside each other's confidence intervals, tighter than the ordinary run-to-run
+drift this document has repeatedly observed elsewhere (§6.4/§6.8), no per-fork red flags. The
+"byte-for-byte unchanged method" argument was correct, now confirmed rather than merely argued.
+
 **Scope limit, not yet addressed**: still int-only columns, matching this whole prototype's
 existing int-key/double-value scope (§6, opening paragraph). Real Pinot GROUP BY keys are
 often STRING or a mix of types — supporting that would mean either a variable-length off-heap
