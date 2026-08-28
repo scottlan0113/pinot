@@ -620,6 +620,24 @@ adaptive capacity. Adaptive capacity's bookkeeping cost is real but is more than
 its ~98.5% memory reduction, and it still beats Direction A by a wide margin even carrying that
 cost.
 
+**Attempted optimization, measured to not help, reverted**: the natural next question is
+whether that remaining bookkeeping cost can be cut. `updateSignal()` recomputes `top1Share` (a
+division) and its two threshold comparisons on every single post-gate upsert; the obvious fix
+is to amortize that check to once every N upserts instead, with a final unconditional check in
+`finishAllShards()` so the sampling can only delay detecting a tier crossing, never change the
+final capacity decision. Implemented (`TOP1_SHARE_CHECK_INTERVAL = 100`), verified correct
+(regression suite still 5/5), then measured on both JMH benchmarks: no measurable improvement.
+Skewed-adaptive moved from 48,762.513 ± 325.504 to 48,383.349 ± 293.989 us/op — directionally
+lower, but the two 99.9% CIs overlap ([48,437-49,088] vs. [48,089-48,677]), so this is not
+distinguishable from ordinary run-to-run noise. Uniform-adaptive was statistically unchanged
+(41,043.798 -> 41,107.419 us/op). Reverted rather than kept as unproven complexity. Likely
+reason it didn't help: the division+comparisons amortized away were probably never the
+dominant cost in `updateSignal` — `_runningTotal[shard] += rawValue`, `_sampleCount[shard]++`,
+and the `_runningMax` compare-and-maybe-write still run on *every* upsert regardless (removing
+them isn't safe, the signal needs them), and are the more likely target for a future attempt.
+Not confirmed by profiling — noted as a hypothesis for whoever picks this up next, not a
+finding.
+
 ### 6.5 Adaptive capacity ported from Direction A
 
 `ShardedOffHeapGroupTable` gained an optional `adaptiveCapacity` flag, porting Direction A's
@@ -717,6 +735,11 @@ many more shards) has not been tried and could plausibly need a smaller constant
   better under the skew #10498 actually targets). Not yet explained: why Direction A's own
   absolute time roughly doubles under skew while both off-heap variants grow far less (§6.4's
   skewed follow-up) — a real, reproduced observation, not yet a profiled mechanism.
+- Adaptive capacity's remaining bookkeeping cost: amortizing the `top1Share` division/comparison
+  was tried and measured to not help (§6.4's closing paragraph), reverted. Actual profiling (not
+  yet done) to find where the real cost is — the always-on `_runningTotal`/`_sampleCount`/
+  `_runningMax` updates are the more likely target than the check that was removed — is the
+  natural next attempt if this is worth pursuing further.
 - The write-lock-for-every-upsert simplification (§6.2) is untested against a more
   fine-grained alternative (e.g. a lock-free or read-write-split scheme over the off-heap
   segment) — unknown how much headroom is being left on the table.
