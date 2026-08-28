@@ -1103,6 +1103,49 @@ reserved sentinel value) and touching the single-column path at all risks the pe
 numbers §6.4/§8 depend on staying exactly reproducible. Flagged for a decision the same way
 the Direction A gate bug was (§4.6), not silently patched.
 
+### 6.8 Non-additive aggregation (2026-08-28)
+
+Closes the other half of the "single numeric, SUM-like (additive) ORDER BY aggregate" scope
+limitation this document has carried since §4.6 — MIN and MAX specifically (AVG and COUNT
+DISTINCT remain out of scope, see below).
+
+**Design**: `OffHeapGroupTable.AggregationType` (`SUM`/`MIN`/`MAX`, each holding a
+`DoubleBinaryOperator`) is a new constructor parameter, defaulting to `SUM` everywhere via
+overloads so every pre-existing call site (including all three benchmark classes in
+`pinot-perf`) is unaffected. Unlike multi-column keys (§6.7), this did NOT need a separate
+code path — the change is a single, localized swap inside `upsert()`'s "existing key found"
+branch (`existing + value` → `_aggregationType.merge(existing, value)`), applied identically
+whether the table is single- or multi-column. `ShardedOffHeapGroupTable` threads the same
+parameter through and **rejects `adaptiveCapacity=true` combined with a non-`SUM`
+aggregation at construction time**: `top1Share`'s signal assumes "sum of every upsert's raw
+contribution approximates the key's final aggregated value," which holds for SUM but not
+MIN/MAX (a key's true minimum has no relationship to how many times it was sampled), so
+combining them would produce a shrink decision based on a meaningless number rather than
+silently doing so.
+
+**Verification**: five new tests — `testMinAggregation`/`testMaxAggregation` (basic multi-set
+merge correctness), `testAdaptiveCapacityWithNonSumAggregationThrows` (the guard above, both
+MIN and MAX), `testMinMaxAggregationUnderRealConcurrentThreads` (concurrency, mirroring the
+existing SUM routing test — the exclusive per-shard/sub-segment write lock makes correctness
+independent of which merge function runs inside it in principle, verified rather than assumed),
+and `testMultiColumnKeyWithMinAggregationAndSubSegments` (a combined smoke test for both new
+capabilities from this stretch of work together, since neither was tested in combination with
+the other before). All 17 tests in the suite (12 from §6.7 + 5 new) verified clean across 5
+separate full-suite runs — no flakiness, no regression.
+
+**Scope limit, not yet addressed**: AVG would need a running (sum, count) pair rather than a
+single double — a bigger change to the record layout than swapping a merge function, not
+attempted here. COUNT DISTINCT is a different problem entirely (needs a set or sketch
+per group, not a scalar aggregate) and is out of scope for this prototype regardless.
+
+**Not JMH-measured**: MIN/MAX are correctness-verified only. The existing SUM-only benchmark
+numbers (§6.4/§6.5/§6.7) are unaffected in principle — `AggregationType.SUM`'s merge behavior
+is unchanged (`Double::sum` is the same operation as the old hardcoded `existing + value`) —
+but the *mechanism* changed from an inlined arithmetic expression to a stored
+`DoubleBinaryOperator` call, and no fresh JMH run was done to confirm that swap is genuinely
+free. Worth a quick re-check before leaning on the exact old numbers in a context where it
+matters (e.g. a PR), rather than assuming it.
+
 ## 7. Recommendation: Direction C
 
 Per Jackie's explicit request to weigh all three directions and reach a recommendation through

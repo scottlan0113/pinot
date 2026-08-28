@@ -91,6 +91,10 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// sub-segment routing both hash the full composite key (not just the first column), and adaptive
 /// capacity's top1Share signal is unaffected either way -- it only ever looks at VALUES.
 ///
+/// Non-SUM aggregation: OffHeapGroupTable.AggregationType (MIN/MAX, DESIGN.md Sec 6.7) is supported here
+/// too, but NOT combined with adaptiveCapacity=true -- the constructor throws in that combination, since
+/// top1Share's "sum of raw contributions approximates the aggregated total" assumption is specific to SUM.
+///
 /// Arena lifecycle: one Arena.ofShared() (NOT ofConfined() -- confined arenas restrict access to their
 /// creating thread, which would throw for every other thread touching a shared shard) backs every
 /// shard's memory. close() closes it once, freeing every shard's memory together.
@@ -193,6 +197,27 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
       boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments,
       int numKeyColumns) {
+    this(numShards, perShardInitialCapacity, fullCapacity, adaptiveCapacity, numSubSegments,
+        divideInitialCapacityAcrossSubSegments, numKeyColumns, OffHeapGroupTable.AggregationType.SUM);
+  }
+
+  /// @param aggregationType SUM (default everywhere else), MIN, or MAX -- added while testing DESIGN.md's
+  ///                       "single numeric SUM-like (additive) aggregate" scope limitation (Sec 4.6).
+  ///                       NOT orthogonal to adaptiveCapacity, unlike numKeyColumns: the top1Share signal
+  ///                       (below) assumes "sum of every upsert's raw contribution equals the sum of all
+  ///                       keys' final aggregated values", which holds for SUM but not MIN/MAX -- a
+  ///                       MIN/MAX table with a genuinely low/high value early on would look artificially
+  ///                       "concentrated" to a signal built for SUM, an incorrect basis for shrinking.
+  ///                       Combining adaptiveCapacity=true with a non-SUM aggregationType throws rather
+  ///                       than silently producing a meaningless signal.
+  public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
+      boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments,
+      int numKeyColumns, OffHeapGroupTable.AggregationType aggregationType) {
+    if (adaptiveCapacity && aggregationType != OffHeapGroupTable.AggregationType.SUM) {
+      throw new IllegalArgumentException(
+          "adaptiveCapacity requires aggregationType == SUM (top1Share is not a meaningful signal for "
+              + aggregationType + ") -- got adaptiveCapacity=true with aggregationType=" + aggregationType);
+    }
     _numShards = numShards;
     _numSubSegments = numSubSegments;
     _numKeyColumns = numKeyColumns;
@@ -215,7 +240,7 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
       _sampleCount[i] = new LongAdder();
       _currentTier[i] = new AtomicInteger(0);
       for (int j = 0; j < numSubSegments; j++) {
-        _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, numKeyColumns, _arena);
+        _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, numKeyColumns, _arena, aggregationType);
         _locks[i][j] = new ReentrantReadWriteLock();
       }
     }

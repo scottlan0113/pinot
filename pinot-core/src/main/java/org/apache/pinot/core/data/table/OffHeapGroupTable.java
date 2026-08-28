@@ -22,6 +22,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
+import java.util.function.DoubleBinaryOperator;
 
 
 /// Prototype for Jackie's "Direction B" proposal (2026-08-27): a per-thread-scoped GROUP BY table backed
@@ -31,7 +32,10 @@ import java.util.Arrays;
 /// off-heap implementation tractable without also needing to solve concurrent off-heap access.
 ///
 /// Scope matches Direction A for apples-to-apples comparison: single INT group-by key, single DOUBLE
-/// SUM-like aggregate (mirrors every benchmark used throughout this investigation, GROUP BY d1 / sum(m1)).
+/// aggregate. SUM is still the only aggregation every benchmark in this investigation actually exercises
+/// (GROUP BY d1 / sum(m1)) and remains the default everywhere -- MIN/MAX (see AggregationType below) were
+/// added to test DESIGN.md's "single numeric SUM-like (additive) aggregate" scope limitation (Sec 4.6),
+/// correctness-verified but not JMH-measured.
 ///
 /// Layout: each off-heap record is `recordSize` bytes -- `4 * numKeyColumns` bytes of consecutive int key
 /// columns (offset 0), then the 8-byte double value at the next 8-byte-aligned offset (padding in between
@@ -63,6 +67,29 @@ import java.util.Arrays;
 /// NOTE: caller MUST call close() when done with this table, or the native memory leaks for real --
 /// unlike JVM heap objects, nothing here is garbage collected.
 public class OffHeapGroupTable implements AutoCloseable {
+  /// SUM is this class's original, still-default, only-ever-benchmarked aggregation -- MIN/MAX (added
+  /// while testing DESIGN.md's "single numeric SUM-like (additive) aggregate" scope limitation, Sec 4.6)
+  /// are real but comparatively lightly-exercised additions, correctness-tested, not JMH-measured. Note
+  /// for whoever adds a MIN/MAX benchmark later: mixing aggregation types across table instances
+  /// constructed in the same JVM/fork as the existing SUM-only benchmarks could in principle affect the
+  /// JIT's inline cache for upsert()'s merge call and disturb previously-measured SUM numbers -- keep
+  /// non-SUM benchmarking in its own fork if that ever matters.
+  public enum AggregationType {
+    SUM(Double::sum),
+    MIN(Math::min),
+    MAX(Math::max);
+
+    private final DoubleBinaryOperator _merge;
+
+    AggregationType(DoubleBinaryOperator merge) {
+      _merge = merge;
+    }
+
+    double merge(double existing, double incoming) {
+      return _merge.applyAsDouble(existing, incoming);
+    }
+  }
+
   private static final long KEY_OFFSET = 0;
   private static final int EMPTY_KEY = Integer.MIN_VALUE; // single-column mode sentinel (in _indexKeys)
   private static final int EMPTY_SLOT = -1; // multi-column mode sentinel (in _indexSlots)
@@ -71,6 +98,7 @@ public class OffHeapGroupTable implements AutoCloseable {
   private final Arena _arena;
   private final boolean _ownsArena;
   private final int _numKeyColumns;
+  private final AggregationType _aggregationType;
   private final long _valueOffset;
   private final long _recordSize;
   private MemorySegment _segment;
@@ -90,7 +118,7 @@ public class OffHeapGroupTable implements AutoCloseable {
   /// Single-thread-owned, single-column table: creates its own confined Arena (JVM-enforced single-thread
   /// access, matching the original Direction B proposal) and frees it in close(). Existing behavior, unchanged.
   public OffHeapGroupTable(int initialCapacity) {
-    this(initialCapacity, 1, Arena.ofConfined(), true);
+    this(initialCapacity, 1, Arena.ofConfined(), true, AggregationType.SUM);
   }
 
   /// Shard-owned, single-column table: uses an externally-provided Arena instead of creating its own, so
@@ -101,23 +129,33 @@ public class OffHeapGroupTable implements AutoCloseable {
   /// shard. close() on an instance built this way does NOT close the arena -- the owner (whoever passed
   /// it in) is responsible for closing it exactly once, after all sharers are done.
   public OffHeapGroupTable(int initialCapacity, Arena arena) {
-    this(initialCapacity, 1, arena, false);
+    this(initialCapacity, 1, arena, false, AggregationType.SUM);
   }
 
   /// Shard-owned, multi-column table -- same Arena-sharing contract as the two-arg constructor above,
   /// with numKeyColumns > 1 consecutive int key columns instead of one. See class Javadoc for why this
   /// is a strictly separate mode rather than a drop-in generalization of the single-column one.
   public OffHeapGroupTable(int initialCapacity, int numKeyColumns, Arena arena) {
-    this(initialCapacity, numKeyColumns, arena, false);
+    this(initialCapacity, numKeyColumns, arena, false, AggregationType.SUM);
   }
 
-  private OffHeapGroupTable(int initialCapacity, int numKeyColumns, Arena arena, boolean ownsArena) {
+  /// Shard-owned table with an explicit AggregationType (default SUM everywhere else) -- MIN/MAX added
+  /// while testing DESIGN.md's "single numeric SUM-like (additive) aggregate" scope limitation (Sec 4.6).
+  /// Applies to both single- and multi-column tables; the aggregation type is orthogonal to how many key
+  /// columns there are.
+  public OffHeapGroupTable(int initialCapacity, int numKeyColumns, Arena arena, AggregationType aggregationType) {
+    this(initialCapacity, numKeyColumns, arena, false, aggregationType);
+  }
+
+  private OffHeapGroupTable(int initialCapacity, int numKeyColumns, Arena arena, boolean ownsArena,
+      AggregationType aggregationType) {
     if (numKeyColumns < 1) {
       throw new IllegalArgumentException("numKeyColumns must be >= 1, got " + numKeyColumns);
     }
     _arena = arena;
     _ownsArena = ownsArena;
     _numKeyColumns = numKeyColumns;
+    _aggregationType = aggregationType;
     long keyBytes = 4L * numKeyColumns;
     _valueOffset = ((keyBytes + 7) / 8) * 8; // round up to 8-byte alignment for the double
     _recordSize = _valueOffset + 8;
@@ -133,19 +171,20 @@ public class OffHeapGroupTable implements AutoCloseable {
     _indexSize = 0;
   }
 
-  /// Single-column upsert: adds `value` to the running aggregate for `key` (SUM semantics), inserting a
-  /// new record if `key` has not been seen before. Returns the key's new aggregated value post-upsert --
-  /// callers that want to track a concentration signal (e.g. adaptive capacity, see
-  /// ShardedOffHeapGroupTable) need this and would otherwise have to do a second, redundant lookup for it.
-  /// Only valid on a table constructed with numKeyColumns == 1 -- throws otherwise, since calling this on
-  /// a multi-column table would silently ignore every key column past the first.
+  /// Single-column upsert: combines `value` into the running aggregate for `key` using this table's
+  /// AggregationType (SUM by default), inserting a new record if `key` has not been seen before. Returns
+  /// the key's new aggregated value post-upsert -- callers that want to track a concentration signal
+  /// (e.g. adaptive capacity, see ShardedOffHeapGroupTable -- SUM-only, see its own Javadoc) need this
+  /// and would otherwise have to do a second, redundant lookup for it. Only valid on a table constructed
+  /// with numKeyColumns == 1 -- throws otherwise, since calling this on a multi-column table would
+  /// silently ignore every key column past the first.
   public double upsert(int key, double value) {
     requireSingleColumn();
     int probe = indexOf(key);
     if (probe >= 0) {
       int slot = _indexSlots[probe];
       double existing = _segment.get(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset);
-      double updated = existing + value;
+      double updated = _aggregationType.merge(existing, value);
       _segment.set(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset, updated);
       return updated;
     }
@@ -164,7 +203,7 @@ public class OffHeapGroupTable implements AutoCloseable {
     return value;
   }
 
-  /// Multi-column upsert: same SUM semantics and new-composite-key-insertion behavior as the
+  /// Multi-column upsert: same aggregation semantics and new-composite-key-insertion behavior as the
   /// single-column upsert above, but keyed by `keys.length` consecutive int columns instead of one. Only
   /// valid on a table constructed with numKeyColumns > 1 and matching keys.length -- see class Javadoc for
   /// why single- and multi-column usage cannot be mixed on the same table instance.
@@ -174,7 +213,7 @@ public class OffHeapGroupTable implements AutoCloseable {
     if (probe >= 0) {
       int slot = _indexSlots[probe];
       double existing = _segment.get(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset);
-      double updated = existing + value;
+      double updated = _aggregationType.merge(existing, value);
       _segment.set(ValueLayout.JAVA_DOUBLE, slot * _recordSize + _valueOffset, updated);
       return updated;
     }

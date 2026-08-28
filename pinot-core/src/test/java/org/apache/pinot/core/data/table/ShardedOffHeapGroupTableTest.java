@@ -324,6 +324,156 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   @Test
+  public void testMinAggregation() {
+    // Non-SUM aggregation (DESIGN.md Sec 6.7's other new capability, testing the "single numeric
+    // SUM-like (additive) aggregate" scope limitation from Sec 4.6).
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 16, 16, false, 1, true, 1,
+        OffHeapGroupTable.AggregationType.MIN)) {
+      table.upsert(1, 10d);
+      table.upsert(1, 3d);
+      table.upsert(1, 7d);
+      table.upsert(2, 5d);
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), 2);
+      Map<Integer, Double> result = new java.util.HashMap<>();
+      table.forEachEntry(result::put);
+      Assert.assertEquals(result.get(1), 3d);
+      Assert.assertEquals(result.get(2), 5d);
+    }
+  }
+
+  @Test
+  public void testMaxAggregation() {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 16, 16, false, 1, true, 1,
+        OffHeapGroupTable.AggregationType.MAX)) {
+      table.upsert(1, 10d);
+      table.upsert(1, 3d);
+      table.upsert(1, 7d);
+      table.upsert(2, 5d);
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), 2);
+      Map<Integer, Double> result = new java.util.HashMap<>();
+      table.forEachEntry(result::put);
+      Assert.assertEquals(result.get(1), 10d);
+      Assert.assertEquals(result.get(2), 5d);
+    }
+  }
+
+  @Test
+  public void testAdaptiveCapacityWithNonSumAggregationThrows() {
+    // top1Share's "sum of raw contributions approximates the aggregated total" assumption is specific to
+    // SUM (DESIGN.md Sec 4.3/6.7) -- combining it with MIN/MAX must fail loudly, not silently produce a
+    // meaningless signal.
+    Assert.assertThrows(IllegalArgumentException.class,
+        () -> new ShardedOffHeapGroupTable(NUM_SHARDS, 16, 16, true, 1, true, 1,
+            OffHeapGroupTable.AggregationType.MIN));
+    Assert.assertThrows(IllegalArgumentException.class,
+        () -> new ShardedOffHeapGroupTable(NUM_SHARDS, 16, 16, true, 1, true, 1,
+            OffHeapGroupTable.AggregationType.MAX));
+  }
+
+  @Test
+  public void testMinMaxAggregationUnderRealConcurrentThreads()
+      throws Exception {
+    // Same routing/merge correctness guarantee as the SUM concurrency tests, exercised against MIN/MAX
+    // instead. The exclusive per-(shard, sub-segment) write lock makes concurrency safety independent of
+    // which merge function runs inside it in principle, but AggregationType is a genuinely new code path
+    // worth its own end-to-end check rather than assuming that reasoning holds without verifying it.
+    int cardinality = 5000;
+    ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+    Map<Integer, Double> groundTruthMin = new ConcurrentHashMap<>();
+    Map<Integer, Double> groundTruthMax = new ConcurrentHashMap<>();
+    try (ShardedOffHeapGroupTable minTable = new ShardedOffHeapGroupTable(NUM_SHARDS, 256, 256, false, 1, true, 1,
+        OffHeapGroupTable.AggregationType.MIN);
+        ShardedOffHeapGroupTable maxTable = new ShardedOffHeapGroupTable(NUM_SHARDS, 256, 256, false, 1, true, 1,
+            OffHeapGroupTable.AggregationType.MAX)) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < NUM_THREADS; t++) {
+        long seed = 7000L + t;
+        futures.add(executor.submit(() -> {
+          Random random = new Random(seed);
+          for (int r = 0; r < 20_000; r++) {
+            int key = random.nextInt(cardinality);
+            double value = random.nextDouble() * 100;
+            minTable.upsert(key, value);
+            maxTable.upsert(key, value);
+            groundTruthMin.merge(key, value, Math::min);
+            groundTruthMax.merge(key, value, Math::max);
+          }
+        }));
+      }
+      for (Future<?> f : futures) {
+        f.get(30, TimeUnit.SECONDS);
+      }
+      executor.shutdown();
+
+      minTable.finishAllShards();
+      maxTable.finishAllShards();
+      Map<Integer, Double> minResult = new java.util.HashMap<>();
+      minTable.forEachEntry(minResult::put);
+      Map<Integer, Double> maxResult = new java.util.HashMap<>();
+      maxTable.forEachEntry(maxResult::put);
+
+      Assert.assertEquals(minResult.size(), groundTruthMin.size());
+      Assert.assertEquals(maxResult.size(), groundTruthMax.size());
+      for (Map.Entry<Integer, Double> entry : groundTruthMin.entrySet()) {
+        Assert.assertEquals(minResult.get(entry.getKey()), entry.getValue(), 1e-9,
+            "MIN mismatch for key " + entry.getKey());
+      }
+      for (Map.Entry<Integer, Double> entry : groundTruthMax.entrySet()) {
+        Assert.assertEquals(maxResult.get(entry.getKey()), entry.getValue(), 1e-9,
+            "MAX mismatch for key " + entry.getKey());
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testMultiColumnKeyWithMinAggregationAndSubSegments()
+      throws Exception {
+    // Smoke test combining both new capabilities from this stretch of work (DESIGN.md Sec 6.7): a
+    // multi-column key with a non-SUM aggregation, plus sub-segments -- confirms there is no interaction
+    // bug, e.g. the wrong merge function applied during finishAllShards()'s sub-segment consolidation.
+    int cardinalityPerColumn = 40;
+    ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+    Map<List<Integer>, Double> groundTruth = new ConcurrentHashMap<>();
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 256, 256, false, 4, true, 2,
+        OffHeapGroupTable.AggregationType.MIN)) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < NUM_THREADS; t++) {
+        long seed = 8000L + t;
+        futures.add(executor.submit(() -> {
+          Random random = new Random(seed);
+          for (int r = 0; r < 20_000; r++) {
+            int[] keys = new int[]{random.nextInt(cardinalityPerColumn), random.nextInt(cardinalityPerColumn)};
+            double value = random.nextDouble() * 100;
+            table.upsert(keys, value);
+            groundTruth.merge(toList(keys), value, Math::min);
+          }
+        }));
+      }
+      for (Future<?> f : futures) {
+        f.get(30, TimeUnit.SECONDS);
+      }
+      executor.shutdown();
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), groundTruth.size());
+      Map<List<Integer>, Double> result = new java.util.HashMap<>();
+      table.forEachMultiColumnEntry((keys, value) -> result.put(toList(keys), value));
+      for (Map.Entry<List<Integer>, Double> entry : groundTruth.entrySet()) {
+        Assert.assertEquals(result.get(entry.getKey()), entry.getValue(), 1e-9,
+            "MIN mismatch for composite key " + entry.getKey());
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
   public void testAdaptiveCapacityWithSubSegmentsShrinksOnSkewedData()
       throws Exception {
     // Sub-segmenting was extended to adaptive capacity (§6.2) by moving the top1Share signal
