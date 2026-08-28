@@ -1138,13 +1138,25 @@ single double — a bigger change to the record layout than swapping a merge fun
 attempted here. COUNT DISTINCT is a different problem entirely (needs a set or sketch
 per group, not a scalar aggregate) and is out of scope for this prototype regardless.
 
-**Not JMH-measured**: MIN/MAX are correctness-verified only. The existing SUM-only benchmark
-numbers (§6.4/§6.5/§6.7) are unaffected in principle — `AggregationType.SUM`'s merge behavior
-is unchanged (`Double::sum` is the same operation as the old hardcoded `existing + value`) —
-but the *mechanism* changed from an inlined arithmetic expression to a stored
-`DoubleBinaryOperator` call, and no fresh JMH run was done to confirm that swap is genuinely
-free. Worth a quick re-check before leaning on the exact old numbers in a context where it
-matters (e.g. a PR), rather than assuming it.
+**MIN/MAX themselves are correctness-verified only, not JMH-measured** (no dedicated MIN/MAX
+benchmark exists). The SUM path specifically, which is what every existing §6.4/§6.5/§6.7
+number depends on, WAS re-verified (2026-08-28): `BenchmarkShardedOffHeapGroupTableSingleThread`
+run against `git worktree`-isolated checkouts of the commit right before this change
+(`2b9e363`) and current HEAD (`542d46b`), same JMH config (3 forks x 5 iterations) both sides.
+`fixedSingleThread` (pure SUM, single-column): 19545.9 -> 19518.6 us/op, a 0.14% difference,
+well inside the error bars on both sides — no regression. `adaptiveSingleThread` looked
+different on the first pass (24528.7 -> 25384.0, +3.5%, consistent across all 3 "after"
+forks, not one noisy fork) but a same-code rerun of just `adaptiveSingleThread` on the
+"after" tree landed at 24459.2 -- close to the ORIGINAL "before" number, not the first
+"after" one. Same code, two runs, ~4% apart: the first "after" reading was itself
+environmental noise (this specific ratio already has real run-to-run drift independent of any
+code change — the ~20.5% adaptive/fixed gap documented in §6.4's single-thread isolation
+finding was itself measured on a different day and doesn't exactly match either of these
+runs' own ~20-30% spread). Conclusion: the `DoubleBinaryOperator` indirection is genuinely
+free for the SUM case in this JVM (`AggregationType.SUM.merge()` optimizes down to the same
+cost as the old hardcoded `existing + value`, presumably via monomorphic inlining since only
+`SUM` is ever exercised in these benchmarks) — the existing SUM-only numbers throughout this
+document remain valid as reported, not merely assumed to be.
 
 ## 7. Recommendation: Direction C
 
