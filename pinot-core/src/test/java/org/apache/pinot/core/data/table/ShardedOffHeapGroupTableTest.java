@@ -71,6 +71,31 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   @Test
+  public void testIntegerMinValueKeyMergesCorrectly() {
+    // Regression test for a latent bug found (not by symptom, by code inspection) while designing the
+    // multi-column index (DESIGN.md Sec 6.7): the single-column on-heap index used to store
+    // Integer.MIN_VALUE directly in _indexKeys as its "this slot is empty" sentinel, so a real GROUP BY
+    // key of exactly that value was indistinguishable from an empty slot -- upserts of it never merged
+    // (each one silently inserted a new, separate off-heap record instead of finding the earlier one).
+    // Fixed by moving occupancy tracking to _indexSlots (a dedicated sentinel, not a reserved key value).
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 16)) {
+      table.upsert(Integer.MIN_VALUE, 10d);
+      table.upsert(1, 20d); // an ordinary key too, to confirm this doesn't disturb normal routing
+      table.upsert(Integer.MIN_VALUE, 5d); // must merge with the first upsert, not create a duplicate
+      table.upsert(Integer.MIN_VALUE, 7d);
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), 2, "Integer.MIN_VALUE as a key must merge into ONE entry, "
+          + "not one per upsert");
+
+      Map<Integer, Double> result = new java.util.HashMap<>();
+      table.forEachEntry(result::put);
+      Assert.assertEquals(result.get(Integer.MIN_VALUE), 22d);
+      Assert.assertEquals(result.get(1), 20d);
+    }
+  }
+
+  @Test
   public void testSameKeyAlwaysRoutesToSameShardAcrossThreads()
       throws Exception {
     // A key's true aggregated value can only be correct if every upsert of that key -- regardless of

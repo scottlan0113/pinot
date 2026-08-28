@@ -1089,19 +1089,41 @@ this prototype onto Pinot's real `Record`/`Key`/`DataSchema` classes, which is r
 work as query-engine wiring (§6.6) rather than a separate item worth solving in isolation
 first.
 
-**Tangential finding, NOT fixed**: designing the multi-column index's empty-slot sentinel
-surfaced a latent bug in the *original* single-column index, unrelated to this session's own
-changes — `indexOf`/`insertIntoIndex` use `Integer.MIN_VALUE` as the "this slot is empty"
-sentinel stored directly in `_indexKeys`, so a real GROUP BY key of exactly
+**Tangential finding, FIXED 2026-08-28**: designing the multi-column index's empty-slot
+sentinel surfaced a latent bug in the *original* single-column index, unrelated to this
+session's own changes — `indexOf`/`insertIntoIndex` used `Integer.MIN_VALUE` as the "this
+slot is empty" sentinel stored directly in `_indexKeys`, so a real GROUP BY key of exactly
 `Integer.MIN_VALUE` would never be found after insertion (the lookup loop's
-`_indexKeys[i] != EMPTY_KEY` check treats that occupied slot as if it were empty). Extremely
-edge-case (requires a key exactly equal to `-2147483648`) and does not affect any benchmark or
-test run so far, none of which use that value — left as-is rather than fixed, since fixing it
-was not part of what multi-column support required (the new multi-column index already avoids
-this failure mode entirely, via a dedicated `_indexSlots`-based occupancy check rather than a
-reserved sentinel value) and touching the single-column path at all risks the performance
-numbers §6.4/§8 depend on staying exactly reproducible. Flagged for a decision the same way
-the Direction A gate bug was (§4.6), not silently patched.
+`_indexKeys[i] != EMPTY_KEY` check treated that occupied slot as if it were empty — repeated
+upserts of that key never merged, silently creating a separate off-heap record every time).
+Extremely edge-case (requires a key exactly equal to `-2147483648`) and did not affect any
+benchmark or test run before this fix, none of which used that value.
+
+Initially left as-is (flagged for a decision the same way the Direction A gate bug was, §4.6)
+specifically because fixing it meant touching `indexOf`/`insertIntoIndex` — the exact hot-path
+methods every §6.4/§8 performance number depends on. Fixed by unifying BOTH the single- and
+multi-column index onto the occupancy check the multi-column path already used correctly
+(`_indexSlots[i] != EMPTY_SLOT`, a dedicated sentinel already always maintained) instead of a
+reserved key value — same hash function, same probing sequence, same storage, only the
+occupancy CHECK moved from one array to the other. `EMPTY_KEY`/`Integer.MIN_VALUE`-as-sentinel
+is gone entirely, not special-cased around.
+
+Verification: (1) red/green — the new regression test
+(`testIntegerMinValueKeyMergesCorrectly`) was confirmed to FAIL against the pre-fix code
+(`totalSize` 4 instead of 2 — every upsert of `Integer.MIN_VALUE` really did create a separate
+record) before confirming it passes with the fix, rather than trusting the code-inspection
+reasoning alone. (2) Full suite (18 tests, the new one plus all 17 from §6.7/§6.8) clean
+across 4 runs, no regression to anything else. (3) Performance: same `git worktree`-isolated
+before/after methodology as §6.8's AggregationType check, comparing the commit right before
+this fix (`d279153`) against the fix itself. `fixedSingleThread` showed an elevated first
+reading (19368.4 -> 20077.0 us/op, +3.7%) driven by one visibly hot fork (Fork 1 alone
+averaged ~20,673 vs. Fork 3's ~19,351, itself right on the pre-fix baseline) — a targeted
+rerun of just `fixedSingleThread` landed at 19561.7, back in line with the original baseline,
+confirming the elevated reading was environmental noise, not a real effect of the fix (the
+same conclusion §6.8's AggregationType check reached the same way). `adaptiveSingleThread`
+(24808.2 -> 25338.8, +2.1%) was within the pre-fix run's own wide error bar throughout, never
+a concern. Conclusion: the fix is genuinely free, and every existing SUM-only single-column
+number in this document remains valid.
 
 ### 6.8 Non-additive aggregation (2026-08-28)
 

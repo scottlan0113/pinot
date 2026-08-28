@@ -91,8 +91,7 @@ public class OffHeapGroupTable implements AutoCloseable {
   }
 
   private static final long KEY_OFFSET = 0;
-  private static final int EMPTY_KEY = Integer.MIN_VALUE; // single-column mode sentinel (in _indexKeys)
-  private static final int EMPTY_SLOT = -1; // multi-column mode sentinel (in _indexSlots)
+  private static final int EMPTY_SLOT = -1; // occupancy sentinel for _indexSlots, both modes (see below)
   private static final double MAX_LOAD_FACTOR = 0.7;
 
   private final Arena _arena;
@@ -105,11 +104,14 @@ public class OffHeapGroupTable implements AutoCloseable {
   private int _dataCapacity;
   private int _size;
 
-  // Single-column mode: _indexKeys[i] holds the raw key, EMPTY_KEY means unoccupied.
-  // Multi-column mode: _indexKeys[i] holds hashKeys(...) of the composite key, EMPTY_SLOT in
-  // _indexSlots[i] means unoccupied (there is no reserved "empty hash" value in that mode).
-  // Both arrays are always allocated and initialized regardless of mode (see constructor) so the two
-  // index implementations below never have to reason about which branch initialized them.
+  // Occupancy for BOTH modes is tracked by _indexSlots[i] == EMPTY_SLOT, never by a reserved value in
+  // _indexKeys -- _indexKeys[i] is meaningful only once _indexSlots[i] says the slot is occupied.
+  // Single-column mode: _indexKeys[i] holds the raw key. Multi-column mode: _indexKeys[i] holds
+  // hashKeys(...) of the composite key. (An earlier version of the single-column mode used
+  // Integer.MIN_VALUE as a reserved "empty" key value stored directly in _indexKeys -- a real key of
+  // exactly that value was then indistinguishable from an empty slot, silently breaking lookup/merge/
+  // rehashing for it. Unifying both modes onto _indexSlots' own sentinel, which was already correct and
+  // already always maintained, removes that failure mode entirely rather than special-casing around it.)
   private int[] _indexKeys;
   private int[] _indexSlots;
   private int _indexCapacity;
@@ -166,8 +168,7 @@ public class OffHeapGroupTable implements AutoCloseable {
     _indexCapacity = nextPowerOfTwo(Math.max(16, (int) (_dataCapacity / MAX_LOAD_FACTOR)));
     _indexKeys = new int[_indexCapacity];
     _indexSlots = new int[_indexCapacity];
-    Arrays.fill(_indexKeys, EMPTY_KEY);
-    Arrays.fill(_indexSlots, EMPTY_SLOT);
+    Arrays.fill(_indexSlots, EMPTY_SLOT); // _indexKeys needs no fill -- unread until _indexSlots says occupied
     _indexSize = 0;
   }
 
@@ -265,14 +266,13 @@ public class OffHeapGroupTable implements AutoCloseable {
 
     // Rebuild the index to match the new (compacted) slot numbering.
     _indexSize = 0;
+    Arrays.fill(_indexSlots, EMPTY_SLOT);
     if (_numKeyColumns == 1) {
-      Arrays.fill(_indexKeys, EMPTY_KEY);
       for (int slot = 0; slot < _size; slot++) {
         int key = _segment.get(ValueLayout.JAVA_INT, slot * _recordSize + KEY_OFFSET);
         insertIntoIndex(key, slot);
       }
     } else {
-      Arrays.fill(_indexSlots, EMPTY_SLOT);
       for (int slot = 0; slot < _size; slot++) {
         insertHashIntoIndex(hashKeysAt(slot), slot);
       }
@@ -319,14 +319,16 @@ public class OffHeapGroupTable implements AutoCloseable {
     // owner is responsible for closing it once, after every table sharing it is done.
   }
 
-  // ---------- single-column on-heap index (raw key -> off-heap slot) -- UNCHANGED from the original
-  // single-purpose version of this class; every performance number measured against it all session used
-  // exactly this code. ----------
+  // ---------- single-column on-heap index (raw key -> off-heap slot). Occupancy is checked via
+  // _indexSlots[i] != EMPTY_SLOT (see the field comment above _indexKeys/_indexSlots for why), not via a
+  // reserved value in _indexKeys -- every other aspect (hash function, probing sequence, what's stored)
+  // is unchanged from the original single-purpose version of this class, so every performance number
+  // measured against it all session was re-verified to still hold after this fix (DESIGN.md Sec 6.7). ----
 
   private int indexOf(int key) {
     int mask = _indexCapacity - 1;
     int i = hash(key) & mask;
-    while (_indexKeys[i] != EMPTY_KEY) {
+    while (_indexSlots[i] != EMPTY_SLOT) {
       if (_indexKeys[i] == key) {
         return i;
       }
@@ -338,7 +340,7 @@ public class OffHeapGroupTable implements AutoCloseable {
   private void insertIntoIndex(int key, int slot) {
     int mask = _indexCapacity - 1;
     int i = hash(key) & mask;
-    while (_indexKeys[i] != EMPTY_KEY) {
+    while (_indexSlots[i] != EMPTY_SLOT) {
       i = (i + 1) & mask;
     }
     _indexKeys[i] = key;
@@ -425,19 +427,18 @@ public class OffHeapGroupTable implements AutoCloseable {
     _indexCapacity *= 2;
     _indexKeys = new int[_indexCapacity];
     _indexSlots = new int[_indexCapacity];
-    Arrays.fill(_indexKeys, EMPTY_KEY);
-    Arrays.fill(_indexSlots, EMPTY_SLOT);
+    Arrays.fill(_indexSlots, EMPTY_SLOT); // _indexKeys needs no fill -- unread until _indexSlots says occupied
     _indexSize = 0;
-    if (_numKeyColumns == 1) {
-      for (int i = 0; i < oldKeys.length; i++) {
-        if (oldKeys[i] != EMPTY_KEY) {
+    // Occupancy check (oldSlots[i] != EMPTY_SLOT) is identical for both modes now -- only which insert
+    // function rebuilds the entry differs: single-column re-derives nothing (oldKeys[i] IS the raw key,
+    // re-probed by insertIntoIndex against the NEW capacity/mask), multi-column's oldKeys[i] already
+    // holds the composite key's hash (insertHashIntoIndex takes a hash directly, not the keys themselves).
+    for (int i = 0; i < oldSlots.length; i++) {
+      if (oldSlots[i] != EMPTY_SLOT) {
+        if (_numKeyColumns == 1) {
           insertIntoIndex(oldKeys[i], oldSlots[i]);
-        }
-      }
-    } else {
-      for (int i = 0; i < oldSlots.length; i++) {
-        if (oldSlots[i] != EMPTY_SLOT) {
-          insertHashIntoIndex(oldKeys[i], oldSlots[i]); // oldKeys[i] already holds the hash in this mode
+        } else {
+          insertHashIntoIndex(oldKeys[i], oldSlots[i]);
         }
       }
     }
