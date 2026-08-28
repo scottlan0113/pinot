@@ -601,6 +601,12 @@ public class ShardedOffHeapGroupTableTest {
   private long runUniformWorkload(int cardinality, int fullCapacity, boolean adaptiveCapacity,
       int numSubSegments)
       throws Exception {
+    return runUniformWorkload(cardinality, fullCapacity, adaptiveCapacity, numSubSegments, 100_000);
+  }
+
+  private long runUniformWorkload(int cardinality, int fullCapacity, boolean adaptiveCapacity,
+      int numSubSegments, int recordsPerThread)
+      throws Exception {
     ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
     try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 1_000_000 / NUM_SHARDS,
         fullCapacity, adaptiveCapacity, numSubSegments)) {
@@ -609,7 +615,7 @@ public class ShardedOffHeapGroupTableTest {
         long seed = 6000L + t;
         futures.add(executor.submit(() -> {
           Random random = new Random(seed);
-          for (int r = 0; r < 100_000; r++) {
+          for (int r = 0; r < recordsPerThread; r++) {
             int key = random.nextInt(cardinality);
             double value = random.nextDouble() * 100;
             table.upsert(key, value);
@@ -654,6 +660,42 @@ public class ShardedOffHeapGroupTableTest {
     Assert.assertEquals(r._recallAdaptive, 1.0, "Adaptive capacity must never cost recall on the true top-10");
   }
 
+  @Test
+  public void testAdaptiveCapacityNoFalsePositiveAtLowVolume()
+      throws Exception {
+    // DESIGN.md Sec 6.5's closing caveat, closed 2026-08-28: every adaptive-capacity test above uses
+    // ~15,625 samples/shard on average (100,000 records/thread x 10 threads / 64 shards); this checks
+    // the false-positive guarantee still holds far below that, at ~1,000 samples/shard on average
+    // (6,400 records/thread) -- well under MIN_SAMPLES_BEFORE_ADAPTATION=5000 for most shards.
+    int cardinality = 50_000;
+    int fullCapacity = 5000;
+    int recordsPerThread = 6_400; // ~1,000 samples/shard on average (recordsPerThread * 10 / 64)
+    long fixedSize = runUniformWorkload(cardinality, fullCapacity, false, 1, recordsPerThread);
+    long adaptiveSize = runUniformWorkload(cardinality, fullCapacity, true, 1, recordsPerThread);
+    Assert.assertEquals(adaptiveSize, fixedSize,
+        "Adaptive capacity shrank on uniform, non-concentrated data at low sample volume -- the "
+            + "minimum-sample gate is triggering on noise even below its own threshold");
+  }
+
+  @Test
+  public void testAdaptiveCapacityRecallHoldsAtLowVolumeDuringShrinkRamp()
+      throws Exception {
+    // Companion to the false-positive check above, on the skewed side: ~7,500 samples/shard on average
+    // (48,000 records/thread) is the middle of the steep ramp where real shrinkage starts appearing but
+    // with less evidence behind the decision than the fully-saturated 15,625-sample baseline
+    // (DESIGN.md Sec 6.5) -- recall must still never drop below 100% even mid-ramp, and adaptive must
+    // never hold MORE keys than fixed (shrinking is monotonic and can only reduce, never increase, size).
+    int recordsPerThread = 48_000; // ~7,500 samples/shard on average (recordsPerThread * 10 / 64)
+    SkewResult r = runZipfWorkload(1.0, 1_000_000, 5000, 1, recordsPerThread);
+    Assert.assertTrue(r._adaptiveSize <= r._fixedSize,
+        "Adaptive must never hold more keys than fixed, got fixed=" + r._fixedSize + " adaptive="
+            + r._adaptiveSize);
+    Assert.assertEquals(r._recallFixed, 1.0);
+    Assert.assertEquals(r._recallAdaptive, 1.0,
+        "Adaptive capacity must never cost recall on the true top-10, even mid-ramp with less evidence "
+            + "than the fully-saturated sample volume");
+  }
+
   private static class SkewResult {
     long _fixedSize;
     long _adaptiveSize;
@@ -668,10 +710,18 @@ public class ShardedOffHeapGroupTableTest {
 
   private SkewResult runZipfWorkload(double skew, int cardinality, int fullCapacity, int numSubSegments)
       throws Exception {
+    return runZipfWorkload(skew, cardinality, fullCapacity, numSubSegments, 100_000);
+  }
+
+  private SkewResult runZipfWorkload(double skew, int cardinality, int fullCapacity, int numSubSegments,
+      int recordsPerThread)
+      throws Exception {
     double[] cdf = buildZipfCdf(cardinality, skew);
     Map<Integer, Double> groundTruth = new ConcurrentHashMap<>();
-    Map<Integer, Double> fixedResult = runZipfTable(cdf, fullCapacity, false, numSubSegments, groundTruth);
-    Map<Integer, Double> adaptiveResult = runZipfTable(cdf, fullCapacity, true, numSubSegments, null);
+    Map<Integer, Double> fixedResult =
+        runZipfTable(cdf, fullCapacity, false, numSubSegments, recordsPerThread, groundTruth);
+    Map<Integer, Double> adaptiveResult =
+        runZipfTable(cdf, fullCapacity, true, numSubSegments, recordsPerThread, null);
 
     List<Integer> trueTop10 = topKKeys(groundTruth, 10);
     SkewResult r = new SkewResult();
@@ -683,7 +733,7 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   private Map<Integer, Double> runZipfTable(double[] cdf, int fullCapacity, boolean adaptiveCapacity,
-      int numSubSegments, Map<Integer, Double> groundTruthOut)
+      int numSubSegments, int recordsPerThread, Map<Integer, Double> groundTruthOut)
       throws Exception {
     ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
     boolean recordGroundTruth = groundTruthOut != null;
@@ -694,7 +744,7 @@ public class ShardedOffHeapGroupTableTest {
         long seed = 9000L + t;
         futures.add(executor.submit(() -> {
           Random random = new Random(seed);
-          for (int r = 0; r < 100_000; r++) {
+          for (int r = 0; r < recordsPerThread; r++) {
             int key = sampleZipf(cdf, random);
             double value = 1.0;
             table.upsert(key, value);

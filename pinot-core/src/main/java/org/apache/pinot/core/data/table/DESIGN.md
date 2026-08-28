@@ -1012,6 +1012,47 @@ against this test's specific sample volume (~15,625/shard), not derived from fir
 — a workload with a much smaller per-shard sample budget (e.g. far fewer records per query, or
 many more shards) has not been tried and could plausibly need a smaller constant.
 
+**That caveat closed 2026-08-28.** A dedicated diagnostic (not a permanent benchmark) swept
+average per-shard sample volume from 500 (well below the 5000 gate) through 15,625 (the
+already-validated baseline), for both the uniform (false-positive) and skewed (real-shrinkage)
+regimes together — same discipline as every fix in this section, never checking one regime
+without the other:
+
+| avg samples/shard | Uniform: fixed vs. adaptive | Skewed: reduction | Skewed: recall@10 (fixed / adaptive) |
+|---|---|---|---|
+| 500 | 23,666 / 23,666 (identical) | 0.0% | 1.00 / 1.00 |
+| 1,000 | 36,078 / 36,078 (identical) | 1.3% | 1.00 / 1.00 |
+| 2,500 | 47,948 / 47,948 (identical) | 4.5% | 1.00 / 1.00 |
+| 5,000 | 49,923 / 49,923 (identical) | 19.6% | 1.00 / 1.00 |
+| 7,500 | 49,998 / 49,998 (identical) | 97.5% | 1.00 / 1.00 |
+| 10,000 | 50,000 / 50,000 (identical) | 98.0% | 1.00 / 1.00 |
+| 15,625 (baseline) | 50,000 / 50,000 (identical) | 98.5% | 1.00 / 1.00 |
+
+Two findings, both reassuring:
+
+1. **Zero false positives at every volume tested, including well below the gate.** The
+   uniform workload's fixed and adaptive results are byte-identical at all seven volumes, down
+   to 500 samples/shard on average — the gate's core safety property holds regardless of
+   volume, not just at the one volume this document had validated before.
+2. **Real shrinkage appears below the "average" 5000 threshold, and that's correct, not a
+   bug** — a Zipfian distribution doesn't just concentrate WITHIN a shard's keys, it also
+   concentrates ACROSS shards: whichever shard happens to hold the single hottest key receives
+   far more than its even 1/64 share of total traffic, so that shard's own sample count can
+   individually cross 5000 well before the fleet-wide AVERAGE does (explaining the small but
+   real 1.3-4.5% reduction already visible at nominal averages of 1,000-2,500). The transition
+   is steep, not gradual — most of the eventual ~98% benefit is already captured by an average
+   of ~7,500 samples/shard, roughly half the ~15,625 this document's existing tests use, and
+   recall@10 stays perfect (1.00) through the entire ramp, including the transitional 5,000-7,500
+   band where the shrink decision has the least evidence behind it of any tested point.
+
+No change made to `MIN_SAMPLES_BEFORE_ADAPTATION` as a result — the finding is that 5000
+already behaves safely and delivers benefit reasonably early across the volumes tested, not
+that it needs retuning. Two new permanent regression tests
+(`testAdaptiveCapacityNoFalsePositiveAtLowVolume`,
+`testAdaptiveCapacityRecallHoldsAtLowVolumeDuringShrinkRamp`) lock in the low-volume
+(~1,000/shard) false-positive and recall guarantees so this characterization doesn't silently
+regress later.
+
 **Sub-segmenting extended to adaptive capacity.** Before implementing, checked for existing
 precedent rather than designing from scratch (per-request) — re-read
 `AdaptiveConcurrentIndexedTable` (Direction A's own concurrent top1Share tracking) closely,
@@ -1074,9 +1115,10 @@ the sub-segmenting win.
 
 - The adaptive-capacity gate (§6.5) is a flat, empirically-chosen sample-count constant
   (`MIN_SAMPLES_BEFORE_ADAPTATION=5000`), verified against both a uniform/realistic-value
-  workload and a skew/cardinality sweep together — not yet verified against a workload with a
-  much smaller per-shard sample volume than the ~15,625 both existing tests happen to share
-  (see §6.5's closing caveat).
+  workload and a skew/cardinality sweep together, now including a low-volume sweep (500 to
+  15,625 samples/shard, §6.5's "closed 2026-08-28" finding): zero false positives at every
+  volume tested, and real shrinkage ramps in steeply between 5,000-7,500 samples/shard with
+  recall@10 never dropping below 100%, even during that transition. No longer open.
 - Performance is now JMH-rigor under both a uniform and a skewed workload (§6.4). Resolved:
   fixed capacity is 1.81-2.18x faster than Direction A depending on skew; adaptive capacity is
   1.09-1.95x faster than Direction A and 11.5-67% slower than fixed capacity depending on skew
