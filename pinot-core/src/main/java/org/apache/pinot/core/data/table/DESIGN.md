@@ -638,6 +638,35 @@ them isn't safe, the signal needs them), and are the more likely target for a fu
 Not confirmed by profiling — noted as a hypothesis for whoever picks this up next, not a
 finding.
 
+**Follow-up: actually profiled, then isolated the cost cleanly.** JMH's built-in stack sampler
+(`-prof stack`) on the skewed 10-thread benchmark showed adaptive and fixed capacity with
+*statistically identical* thread-state breakdowns — both ~52.1% WAITING (parked on the per-shard
+write lock), both showing `AbstractQueuedLongSynchronizer.acquire` in the RUNNABLE portion at
+matching percentages. This rules out lock contention as the explanation for the adaptive-vs-fixed
+gap (it's a cost shared equally by both, not specific to adaptive) — real evidence for the
+separate write-lock-per-upsert open item (§6.2/§6.6), just not for this one. Neither variant
+showed `updateSignal` as a distinct hot frame, most likely JIT-inlined into the enclosing loop and
+too fine-grained (a few nanoseconds) for a millisecond-scale sampling profiler to resolve.
+
+To get a clean number anyway, built `BenchmarkShardedOffHeapGroupTableSingleThread.java`: same
+Zipfian keys (pre-generated once in `@Setup`, identical sequence fed to both variants), but a
+single thread upserting directly — no `ExecutorService`, no per-shard lock contention to dilute
+the measurement. Result, no outlier forks: `fixedSingleThread` 18,104.056 ± 109.955 us/op,
+`adaptiveSingleThread` 21,810.335 ± 299.060 us/op — adaptive **~20.5% slower**, working out to
+**~3.7 nanoseconds of extra cost per upsert**. This is larger, not smaller, than the concurrent
+benchmark's ~11.5% gap, which at first looks backwards until the arithmetic is written out: both
+variants pay close to the same *absolute* lock-wait time under contention, and adding the same
+constant to two numbers that differ moves their *ratio* toward 1 — the concurrent number
+understates the true per-upsert cost because a shared, unrelated cost dilutes the percentage.
+The single-threaded number is the honest one.
+
+At ~3.7ns/upsert (roughly a dozen CPU cycles for two array increments, a compare-and-maybe-write,
+and two branch checks), this looks close to irreducible without removing part of what the signal
+needs to work — consistent with why amortizing the top1Share check alone didn't move the needle:
+that check was never more than a small slice of an already-small cost. Current read: this is a
+small, well-understood, tightly-bounded overhead, not an unsolved performance problem — further
+optimization here has a low ceiling and is not recommended as a priority.
+
 ### 6.5 Adaptive capacity ported from Direction A
 
 `ShardedOffHeapGroupTable` gained an optional `adaptiveCapacity` flag, porting Direction A's
@@ -735,11 +764,12 @@ many more shards) has not been tried and could plausibly need a smaller constant
   better under the skew #10498 actually targets). Not yet explained: why Direction A's own
   absolute time roughly doubles under skew while both off-heap variants grow far less (§6.4's
   skewed follow-up) — a real, reproduced observation, not yet a profiled mechanism.
-- Adaptive capacity's remaining bookkeeping cost: amortizing the `top1Share` division/comparison
-  was tried and measured to not help (§6.4's closing paragraph), reverted. Actual profiling (not
-  yet done) to find where the real cost is — the always-on `_runningTotal`/`_sampleCount`/
-  `_runningMax` updates are the more likely target than the check that was removed — is the
-  natural next attempt if this is worth pursuing further.
+- Adaptive capacity's bookkeeping cost is now resolved, not open: stack profiling ruled out lock
+  contention (identical between fixed and adaptive), and a single-threaded isolation benchmark
+  measured it directly at ~3.7ns/upsert (~20.5% of a single-threaded upsert's own cost, diluted
+  to ~11.5% under real contention because both variants pay nearly the same absolute lock-wait
+  time — §6.4's follow-up). Read as a small, tightly-bounded cost with a low ceiling for further
+  optimization, not an unsolved problem.
 - The write-lock-for-every-upsert simplification (§6.2) is untested against a more
   fine-grained alternative (e.g. a lock-free or read-write-split scheme over the off-heap
   segment) — unknown how much headroom is being left on the table.
@@ -831,5 +861,7 @@ underlying iterations before trusting an aggregate.
   (Direction A vs. C JMH benchmark, uniform-key workload, §6.4's follow-up)
 - `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedOffHeapGroupTableSkewed.java`
   (Direction A vs. C JMH benchmark, skewed-key workload, §6.4's skewed follow-up)
+- `pinot-perf/src/main/java/org/apache/pinot/perf/BenchmarkShardedOffHeapGroupTableSingleThread.java`
+  (isolates adaptive capacity's per-upsert cost from lock contention, §6.4's profiling follow-up)
 - `pinot-core/src/test/java/org/apache/pinot/core/data/table/ShardedOffHeapGroupTableTest.java`
   (Direction C regression suite)
