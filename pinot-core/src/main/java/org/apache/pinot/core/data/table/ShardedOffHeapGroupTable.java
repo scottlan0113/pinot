@@ -213,6 +213,29 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
       boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments,
       int numKeyColumns, OffHeapGroupTable.AggregationType aggregationType) {
+    this(numShards, perShardInitialCapacity, fullCapacity, adaptiveCapacity, numSubSegments,
+        divideInitialCapacityAcrossSubSegments, numKeyColumns, aggregationType, false);
+  }
+
+  /// @param segmentZeroFullCapacity Root-caused 2026-08-28 (DESIGN.md Sec 6.2 "Root cause... found"):
+  ///                       sub-segment 0 is the single-threaded MERGE TARGET in finishAllShards() --
+  ///                       every other sub-segment's records get re-upserted into it -- so at high
+  ///                       numSubSegments, starting it at the same small divided capacity as every
+  ///                       other sub-segment (the default) forces it through repeated growData()/
+  ///                       growIndex() calls while absorbing everyone else's data, a real cost
+  ///                       (measured ~13% of total op time at numSubSegments=32). If true, sub-segment
+  ///                       0 alone gets perShardInitialCapacity (undivided), while sub-segments 1..N-1
+  ///                       still respect divideInitialCapacityAcrossSubSegments exactly as before --
+  ///                       unlike that flag (which changes ALL sub-segments and was measured to regress
+  ///                       the concurrent phase badly via 32x total over-allocation at
+  ///                       numSubSegments=32), this only grows ONE sub-segment per shard, a much
+  ///                       smaller and more targeted change. Default false (existing behavior,
+  ///                       unchanged) -- not yet confirmed to be a net win end-to-end (only
+  ///                       finishAllShards() in isolation has been measured so far), so not the
+  ///                       default until it is.
+  public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
+      boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments,
+      int numKeyColumns, OffHeapGroupTable.AggregationType aggregationType, boolean segmentZeroFullCapacity) {
     if (adaptiveCapacity && aggregationType != OffHeapGroupTable.AggregationType.SUM) {
       throw new IllegalArgumentException(
           "adaptiveCapacity requires aggregationType == SUM (top1Share is not a meaningful signal for "
@@ -240,7 +263,8 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
       _sampleCount[i] = new LongAdder();
       _currentTier[i] = new AtomicInteger(0);
       for (int j = 0; j < numSubSegments; j++) {
-        _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, numKeyColumns, _arena, aggregationType);
+        int thisCapacity = (j == 0 && segmentZeroFullCapacity) ? perShardInitialCapacity : perSubSegmentInitialCapacity;
+        _shards[i][j] = new OffHeapGroupTable(thisCapacity, numKeyColumns, _arena, aggregationType);
         _locks[i][j] = new ReentrantReadWriteLock();
       }
     }

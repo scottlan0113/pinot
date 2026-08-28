@@ -731,13 +731,42 @@ or all of the K=16/32 regression, though this diagnostic measured `finishAllShar
 isolation and did not re-run the full concurrent+finish benchmark to confirm the total effect
 size matches exactly.
 
-**Not yet attempted**: an ASYMMETRIC capacity scheme — give segment 0 alone the full,
-undivided capacity (since it is the eventual home for the whole shard's distinct keys either
-way) while segments 1..K-1 keep the small, divided capacity (since they only ever need to hold
-their own transient share) — was not implemented or benchmarked end-to-end. This is now a
-concretely motivated next step, not a guess: it targets exactly the mechanism this diagnostic
-confirmed, without reintroducing the over-allocation cost that made the all-undivided
-experiment regress so badly.
+**Fix implemented and confirmed end-to-end, same day.** Added `segmentZeroFullCapacity`
+(9th constructor parameter, default `false` = unchanged behavior): when `true`, sub-segment 0
+alone gets `perShardInitialCapacity` (undivided) while sub-segments 1..N-1 still respect
+`divideInitialCapacityAcrossSubSegments` exactly as before — unlike the all-undivided
+`*FullCapacity` variants above (which grow EVERY sub-segment and regress the concurrent phase
+via massive total over-allocation), this grows only ONE sub-segment per shard. Verified
+correct first (`testSegmentZeroFullCapacityUnderRealConcurrentThreads`, `numSubSegments=16`,
+real concurrent threads against ground truth — giving one sub-segment a different initial
+capacity must not change routing or merge correctness, only performance; full 19-test suite
+clean across 3 runs) before measuring performance.
+
+Added `shardedOffHeapGroupTableFixedSubSegmented16/32SegmentZeroFullCapacity` to the skewed
+benchmark and compared against the existing (divided-capacity) K=16/32 baselines and K=4, same
+JMH rigor (3 forks x 5 iterations), clean on every fork:
+
+| Configuration | Score (us/op) | vs. same-K baseline | vs. K=4 |
+|---|---|---|---|
+| K=4 (unchanged, still the reference) | 42,669.4 ± 438.7 | — | — |
+| K=16 baseline (divided) | 47,580.5 ± 1,350.6 | — | +11.5% slower |
+| **K=16, segmentZeroFullCapacity** | **42,767.0 ± 687.8** | **10.1% faster** | statistically tied |
+| K=32 baseline (divided) | 47,867.8 ± 549.3 | — | +12.2% slower |
+| **K=32, segmentZeroFullCapacity** | **45,032.6 ± 1,323.3** | **5.9% faster** | +5.5% slower |
+
+K=16 with the fix lands within K=4's own confidence interval — the fix fully recovers K=16 to
+match the previous best, not just "less bad." K=32 improves substantially (a real, per-fork-
+consistent 5.9% win over its own baseline) but still trails K=4/fixed-K=16 by ~5.5% — some
+residual gap remains at the highest K tested, not fully explained, though far smaller than
+before the fix.
+
+**This does not change the recommended default** — K=4 (§6.2 above) is still at least as fast
+as anything else measured, and needs no extra flag. What this closes is the *mystery*, not a
+gap in the recommendation: `numSubSegments` past 4 is no longer an unexplained trap for a
+future caller who might have a different reason to want finer-grained sub-segmentation (e.g. a
+much higher real thread count than this document's NUM_SEGMENTS=10) — it now has a known,
+fixable cause and a working, verified fix available (`segmentZeroFullCapacity=true`) if they
+need it.
 
 ### 6.3 Correctness: real concurrent threads, not simulation
 
@@ -1078,10 +1107,13 @@ the sub-segmenting win.
   cause: segment 0 specifically (the single-threaded merge target in `finishAllShards()`) starts
   undersized at high K and has to repeatedly grow while absorbing every other sub-segment's
   data, a real and substantial cost (~13% of total op time at K=32, isolated via manual timing)
-  that a targeted undivided-vs-divided comparison confirmed directly. Not yet acted on: an
-  asymmetric scheme (segment 0 alone gets full capacity, 1..K-1 stay small) is a concretely
-  motivated fix, not implemented. `numSubSegments=4` remains the recommended default regardless
-  of whether that fix is ever built. A fully lock-free scheme (no `ReentrantReadWriteLock` at all) remains a
+  that a targeted undivided-vs-divided comparison confirmed directly. Implemented and confirmed
+  end-to-end, same day: `segmentZeroFullCapacity=true` (segment 0 alone gets full capacity,
+  1..K-1 stay small) fully recovers K=16 to match K=4's own performance (statistically tied)
+  and substantially improves K=32 (+5.9% over its own baseline, though still ~5.5% behind K=4 --
+  a smaller, not-yet-explained residual gap). `numSubSegments=4` remains the recommended
+  default regardless -- this closes the mystery and removes the trap for a future caller who
+  might want higher K for other reasons, not a reason to move off K=4 today. A fully lock-free scheme (no `ReentrantReadWriteLock` at all) remains a
   different, unexplored, higher-risk idea that a design-phase review (not yet an implementation
   attempt) found a real correctness hazard in around concurrent resize — see the session notes
   for the

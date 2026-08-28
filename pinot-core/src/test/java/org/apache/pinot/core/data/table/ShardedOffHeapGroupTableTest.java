@@ -233,6 +233,53 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   @Test
+  public void testSegmentZeroFullCapacityUnderRealConcurrentThreads()
+      throws Exception {
+    // segmentZeroFullCapacity=true (DESIGN.md Sec 6.2's asymmetric-capacity fix, added after
+    // root-causing the numSubSegments=16/32 regression to sub-segment 0 -- the finishAllShards() merge
+    // target -- starting undersized) must still be exactly correct: giving ONE sub-segment a different
+    // initial capacity than the others must not change routing or merge correctness, only performance.
+    // numSubSegments=16 specifically to exercise the regime this option targets.
+    int cardinality = 5000;
+    int numSubSegments = 16;
+    ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+    Map<Integer, Double> groundTruth = new ConcurrentHashMap<>();
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 256, Integer.MAX_VALUE,
+        false, numSubSegments, true, 1, OffHeapGroupTable.AggregationType.SUM, true)) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < NUM_THREADS; t++) {
+        long seed = 3500L + t;
+        futures.add(executor.submit(() -> {
+          Random random = new Random(seed);
+          for (int r = 0; r < 50_000; r++) {
+            int key = random.nextInt(cardinality);
+            double value = random.nextDouble() * 100;
+            table.upsert(key, value);
+            groundTruth.merge(key, value, Double::sum);
+          }
+        }));
+      }
+      for (Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+      executor.shutdown();
+
+      table.finishAllShards();
+      Assert.assertEquals(table.totalSize(), groundTruth.size(), "Expected every key to survive (no "
+          + "trim at this capacity); a mismatch here would mean the asymmetric-capacity merge lost or "
+          + "duplicated a key");
+      Map<Integer, Double> result = new java.util.HashMap<>();
+      table.forEachEntry(result::put);
+      for (Map.Entry<Integer, Double> entry : groundTruth.entrySet()) {
+        Assert.assertEquals(result.get(entry.getKey()), entry.getValue(), 1e-6,
+            "Mismatch for key " + entry.getKey() + " -- lost or double-counted update across sub-segments");
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
   public void testMultiColumnKeyBasicUpsertAndMerge() {
     // Multi-column counterpart to testBasicUpsertAndMerge (DESIGN.md Sec 4.6's "multi-column GROUP
     // BY... not yet tested" scope item). Two composite keys sharing one column but differing in the

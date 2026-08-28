@@ -25,6 +25,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import org.apache.pinot.common.utils.DataSchema;
+import org.apache.pinot.core.data.table.OffHeapGroupTable;
 import org.apache.pinot.core.data.table.Record;
 import org.apache.pinot.core.data.table.ShardedIndexedTable;
 import org.apache.pinot.core.data.table.ShardedOffHeapGroupTable;
@@ -257,6 +258,37 @@ public class BenchmarkShardedOffHeapGroupTableSkewed {
       throws InterruptedException {
     try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
         TRIM_SIZE, false, 32, false)) {
+      runDirectionC(table);
+    }
+  }
+
+  /// Root-caused 2026-08-28 (DESIGN.md Sec 6.2 "Root cause of the K=16/32 regression found"): a
+  /// dedicated diagnostic isolating finishAllShards() from the concurrent phase found sub-segment 0 (the
+  /// single-threaded merge target) growing repeatedly while absorbing every other sub-segment's data,
+  /// because it starts at the same small divided capacity as everyone else. These variants give ONLY
+  /// sub-segment 0 the full perShardInitialCapacity (segmentZeroFullCapacity=true) while 1..N-1 stay
+  /// divided/small -- unlike the *FullCapacity variants above (which grow EVERY sub-segment and were
+  /// measured to regress the concurrent phase via 32x total over-allocation), this grows only one
+  /// sub-segment per shard. The diagnostic only measured finishAllShards() in isolation; these variants
+  /// are the first end-to-end (concurrent + finish) test of whether that translates into a real net win.
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented16SegmentZeroFullCapacity()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 16, true, 1, OffHeapGroupTable.AggregationType.SUM, true)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableFixedSubSegmented32SegmentZeroFullCapacity()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, false, 32, true, 1, OffHeapGroupTable.AggregationType.SUM, true)) {
       runDirectionC(table);
     }
   }
