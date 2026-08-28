@@ -182,6 +182,17 @@ public class BenchmarkShardedOffHeapGroupTableSkewed {
   @Benchmark
   @BenchmarkMode(Mode.AverageTime)
   @OutputTimeUnit(TimeUnit.MICROSECONDS)
+  public void shardedOffHeapGroupTableAdaptiveSubSegmented4()
+      throws InterruptedException {
+    try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,
+        TRIM_SIZE, true, 4)) {
+      runDirectionC(table);
+    }
+  }
+
+  @Benchmark
+  @BenchmarkMode(Mode.AverageTime)
+  @OutputTimeUnit(TimeUnit.MICROSECONDS)
   public void shardedOffHeapGroupTableFixedSubSegmented4()
       throws InterruptedException {
     try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, TRIM_THRESHOLD / NUM_SHARDS,

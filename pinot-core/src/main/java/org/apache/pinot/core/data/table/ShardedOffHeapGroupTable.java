@@ -19,6 +19,10 @@
 package org.apache.pinot.core.data.table;
 
 import java.lang.foreign.Arena;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.DoubleAccumulator;
+import java.util.concurrent.atomic.DoubleAdder;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 
@@ -35,13 +39,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// upsert to a shard therefore needs full exclusive locking against every other access to that same
 /// shard -- there is no fine-grained "read lock for the common case" available the way
 /// ConcurrentIndexedTable gets from ConcurrentHashMap. This version uses one ReentrantReadWriteLock per
-/// shard and takes the WRITE lock for every upsert, not just for trim/resize. This is a real, deliberate
-/// simplification for a first correctness-focused prototype -- it means more serialization per shard
-/// than Direction A's ConcurrentIndexedTable shards have, and needs to be measured, not assumed, before
-/// claiming a performance verdict against either direction alone. One upside of this simplification: the
-/// adaptive-capacity signal tracking below can use plain double fields instead of the lock-free
-/// DoubleAdder/DoubleAccumulator AdaptiveConcurrentIndexedTable needed -- every upsert already holds the
-/// shard's exclusive write lock, so there is no separate concurrency problem left to solve for the signal.
+/// shard (or per sub-segment, see below) and takes the WRITE lock for every upsert, not just for
+/// trim/resize. This is a real, deliberate simplification for a first correctness-focused prototype --
+/// it means more serialization per shard than Direction A's ConcurrentIndexedTable shards have, and
+/// needs to be measured, not assumed, before claiming a performance verdict against either direction
+/// alone. Adaptive-capacity signal tracking (below) uses the same DoubleAdder/DoubleAccumulator/
+/// AtomicInteger-with-CAS pattern as AdaptiveConcurrentIndexedTable, not plain fields -- with
+/// sub-segmenting, multiple independently-locked sub-segments of the same OUTER shard can update that
+/// shard's signal concurrently, so a single exclusive lock is no longer guaranteed to serialize every
+/// write to it the way it did in the numSubSegments=1-only original version of this class.
 ///
 /// A read-lock-based fast path (fixed capacity takes a shared read lock plus an atomic CAS for an
 /// existing key, escalating to the write lock only for a genuinely new key) was tried and MEASURED TO
@@ -49,20 +55,18 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// The write-lock-for-every-upsert design here is not an unexamined default; it was compared directly
 /// against a more fine-grained alternative and won.
 ///
-/// Sub-segmenting (fixed capacity only): each outer shard can optionally be split into
-/// `numSubSegments` independently-locked OffHeapGroupTable instances instead of one. This keeps the
-/// exact same exclusive-lock-per-critical-section model that beat the read-lock fast path above --
-/// resize is still always safely inside a normal write lock, no new correctness hazard -- just at
-/// finer granularity, so keys hashing to the same OUTER shard but different sub-segments no longer
-/// contend. Deliberately NOT extended to adaptive capacity yet: the top1Share signal is tracked per
-/// OUTER shard specifically to avoid multiplying the memory-ceiling problem (Sec 4.2) that more outer
-/// shards would cause, and splitting the signal-tracking fields across multiple independently-locked
-/// sub-segments needs its own concurrency-safety treatment (DoubleAdder/LongAdder/CAS-based max,
-/// mirroring AdaptiveConcurrentIndexedTable) that hasn't been done -- passing numSubSegments>1 with
-/// adaptiveCapacity=true throws rather than silently doing the wrong thing. finishAllShards() merges
-/// all of a shard's sub-segments into sub-segment 0 (single-threaded at that point, reusing
-/// OffHeapGroupTable's own upsert()) before trimming, so totalSize()/forEachEntry() only ever need to
-/// look at sub-segment 0 per shard -- consistent whether numSubSegments is 1 or more.
+/// Sub-segmenting: each outer shard can optionally be split into `numSubSegments`
+/// independently-locked OffHeapGroupTable instances instead of one. This keeps the exact same
+/// exclusive-lock-per-critical-section model that beat the read-lock fast path above -- resize is
+/// still always safely inside a normal write lock, no new correctness hazard -- just at finer
+/// granularity, so keys hashing to the same OUTER shard but different sub-segments no longer contend.
+/// The top1Share signal is tracked per OUTER shard regardless of numSubSegments, specifically to avoid
+/// multiplying the memory-ceiling problem (Sec 4.2) that more outer shards would cause -- so signal
+/// tracking (below) has to be safe under concurrent access from multiple independently-locked
+/// sub-segments of the same shard, unlike a plain field would be. finishAllShards() merges all of a
+/// shard's sub-segments into sub-segment 0 (single-threaded at that point, reusing OffHeapGroupTable's
+/// own upsert()) before trimming, so totalSize()/forEachEntry() only ever need to look at sub-segment
+/// 0 per shard -- consistent whether numSubSegments is 1 or more.
 ///
 /// numSubSegments does NOT monotonically help -- a JMH sweep (DESIGN.md Sec 6.2) found 4 to be the
 /// clear sweet spot (a real 6.9-8.1% win over numSubSegments=1), with 8 back near the numSubSegments=1
@@ -73,7 +77,11 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /// and REFUTED: giving every sub-segment the full undivided capacity made K=16/32 dramatically worse
 /// (e.g. K=32: 48,266 -> 85,800 us/op), not better, because that also scales TOTAL initial allocation
 /// with numSubSegments rather than isolating resize frequency at a constant total. Why K=16/32 regress
-/// at a properly constant total capacity remains an open question.
+/// at a properly constant total capacity remains an open question. The numSubSegments=4 sweet spot was
+/// found on fixed capacity, but transfers to adaptive capacity too (6.3% win, DESIGN.md Sec 6.5) --
+/// only 4 has been checked for adaptive, not the full 8/16/32 sweep, since the same locking model
+/// (still exclusive, just finer-grained) makes it a plausible extrapolation rather than a fresh
+/// question, but it hasn't been independently re-swept.
 ///
 /// Arena lifecycle: one Arena.ofShared() (NOT ofConfined() -- confined arenas restrict access to their
 /// creating thread, which would throw for every other thread touching a shared shard) backs every
@@ -104,17 +112,19 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   private final OffHeapGroupTable[][] _shards; // [outer shard][sub-segment]
   private final ReentrantReadWriteLock[][] _locks; // [outer shard][sub-segment]
 
-  // Adaptive-capacity bookkeeping, one slot per shard. Plain arrays, not atomics: every write happens
-  // under that shard's write lock already (see upsert()), so there is no separate race to guard against.
-  private final double[] _runningMax;
-  private final double[] _runningTotal;
-  private final long[] _sampleCount; // COUNT of upserts, separate from runningTotal (a SUM of values) --
-  // gating on runningTotal directly was a bug: it only coincidentally equals the sample count when every
-  // upserted value happens to be 1.0. With real (non-unit) values the gate could pass after a handful of
-  // upserts, when runningMax is still just "the single largest raw value seen so far" -- pure small-sample
-  // noise, not a real signal. Caught by testing against a realistic random-value workload, not just the
-  // all-1.0 workload every earlier verification used.
-  private final int[] _currentTier; // 0 = full, 1 = medium, 2 = small; monotonic, only ever increases
+  // Adaptive-capacity bookkeeping, one slot per OUTER shard -- shared across that shard's
+  // sub-segments, which each hold their own independent lock, so these must be genuinely
+  // concurrency-safe rather than plain fields (see class Javadoc). Same primitive types
+  // AdaptiveConcurrentIndexedTable uses, for the same reason (that class's ConcurrentHashMap shards
+  // permit real concurrent access to one shard the way sub-segments here now do too) -- but NOT the
+  // same gate logic: AdaptiveConcurrentIndexedTable's own gate compares _runningTotal.sum() (a SUM of
+  // values) against a sample-count-shaped threshold, apparently the exact bug class fixed here (see
+  // DESIGN.md Sec 4.6) -- not yet fixed there. _sampleCount below is a real, separate LongAdder count,
+  // not reused from the value sum.
+  private final DoubleAccumulator[] _runningMax;
+  private final DoubleAdder[] _runningTotal;
+  private final LongAdder[] _sampleCount;
+  private final AtomicInteger[] _currentTier; // 0 = full, 1 = medium, 2 = small; monotonic via CAS below
 
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity) {
     this(numShards, perShardInitialCapacity, perShardInitialCapacity, false, 1);
@@ -134,8 +144,9 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   }
 
   /// @param numSubSegments Splits each outer shard into this many independently-locked sub-segments
-  ///                        (see class Javadoc). 1 = existing behavior exactly. Only valid with
-  ///                        adaptiveCapacity=false.
+  ///                        (see class Javadoc). 1 = existing behavior exactly. Valid with either
+  ///                        adaptiveCapacity value -- the top1Share signal below is concurrency-safe
+  ///                        regardless of numSubSegments.
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
       boolean adaptiveCapacity, int numSubSegments) {
     this(numShards, perShardInitialCapacity, fullCapacity, adaptiveCapacity, numSubSegments, true);
@@ -157,9 +168,6 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   ///                        this ruled out rather than explained.
   public ShardedOffHeapGroupTable(int numShards, int perShardInitialCapacity, int fullCapacity,
       boolean adaptiveCapacity, int numSubSegments, boolean divideInitialCapacityAcrossSubSegments) {
-    if (adaptiveCapacity && numSubSegments > 1) {
-      throw new IllegalArgumentException("Sub-segmenting is not yet supported for adaptive capacity");
-    }
     _numShards = numShards;
     _numSubSegments = numSubSegments;
     _adaptiveCapacity = adaptiveCapacity;
@@ -169,13 +177,17 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
     _arena = Arena.ofShared();
     _shards = new OffHeapGroupTable[numShards][numSubSegments];
     _locks = new ReentrantReadWriteLock[numShards][numSubSegments];
-    _runningMax = new double[numShards];
-    _runningTotal = new double[numShards];
-    _sampleCount = new long[numShards];
-    _currentTier = new int[numShards];
+    _runningMax = new DoubleAccumulator[numShards];
+    _runningTotal = new DoubleAdder[numShards];
+    _sampleCount = new LongAdder[numShards];
+    _currentTier = new AtomicInteger[numShards];
     int perSubSegmentInitialCapacity = divideInitialCapacityAcrossSubSegments
         ? Math.max(1, perShardInitialCapacity / numSubSegments) : perShardInitialCapacity;
     for (int i = 0; i < numShards; i++) {
+      _runningMax[i] = new DoubleAccumulator(Double::max, 0.0);
+      _runningTotal[i] = new DoubleAdder();
+      _sampleCount[i] = new LongAdder();
+      _currentTier[i] = new AtomicInteger(0);
       for (int j = 0; j < numSubSegments; j++) {
         _shards[i][j] = new OffHeapGroupTable(perSubSegmentInitialCapacity, _arena);
         _locks[i][j] = new ReentrantReadWriteLock();
@@ -225,25 +237,34 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   /// incoming value (valid for SUM-like additive aggregates only -- same documented scope as everywhere
   /// else in this investigation); runningMax must reflect the key's current AGGREGATED value (a hot
   /// key's dominance only shows up in its accumulated total, never in one call's raw contribution).
+  /// Called with `shard` = the OUTER shard index, never the sub-segment -- multiple sub-segments of the
+  /// same outer shard can call this concurrently (each holding only its OWN sub-segment's lock), which
+  /// is exactly why every field this method touches is a concurrency-safe accumulator/CAS type rather
+  /// than a plain field, unlike this class's original numSubSegments=1-only version.
   private void updateSignal(int shard, double rawValue, double updatedValue) {
-    if (_currentTier[shard] == 2) {
+    int currentTier = _currentTier[shard].get();
+    if (currentTier == 2) {
       return; // already at the smallest tier, nothing left to shrink to
     }
-    _runningTotal[shard] += rawValue;
-    _sampleCount[shard]++;
-    if (updatedValue > _runningMax[shard]) {
-      _runningMax[shard] = updatedValue;
-    }
-    if (_sampleCount[shard] < MIN_SAMPLES_BEFORE_ADAPTATION) {
+    _runningTotal[shard].add(rawValue);
+    _sampleCount[shard].increment(); // a real COUNT, not reused from runningTotal's sum -- see field doc
+    _runningMax[shard].accumulate(updatedValue);
+    if (_sampleCount[shard].sum() < MIN_SAMPLES_BEFORE_ADAPTATION) {
       // Too few samples yet -- top1Share is noise-dominated (a lucky early high-value draw, or a key
       // that happened to repeat a couple of times first) rather than a real concentration signal.
       return;
     }
-    double top1Share = _runningMax[shard] / _runningTotal[shard];
+    double top1Share = _runningMax[shard].get() / _runningTotal[shard].sum();
     int targetTier = top1Share < MEDIUM_TOP1_SHARE_THRESHOLD ? 0
         : top1Share < SMALL_TOP1_SHARE_THRESHOLD ? 1 : 2;
-    if (targetTier > _currentTier[shard]) {
-      _currentTier[shard] = targetTier; // monotonic: only ever shrinks, never grows back
+    // CAS retry loop, mirroring AdaptiveConcurrentIndexedTable exactly: monotonic (only ever shrinks),
+    // and safe against another sub-segment's thread racing to advance the same shard's tier at the
+    // same time -- whichever CAS wins, the loser just re-reads and re-checks against the new state.
+    while (targetTier > currentTier) {
+      if (_currentTier[shard].compareAndSet(currentTier, targetTier)) {
+        break;
+      }
+      currentTier = _currentTier[shard].get();
     }
   }
 
@@ -251,7 +272,7 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
     if (!_adaptiveCapacity) {
       return _fullCapacity;
     }
-    return switch (_currentTier[shard]) {
+    return switch (_currentTier[shard].get()) {
       case 1 -> _mediumCapacity;
       case 2 -> _smallCapacity;
       default -> _fullCapacity;

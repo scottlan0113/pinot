@@ -909,6 +909,64 @@ against this test's specific sample volume (~15,625/shard), not derived from fir
 — a workload with a much smaller per-shard sample budget (e.g. far fewer records per query, or
 many more shards) has not been tried and could plausibly need a smaller constant.
 
+**Sub-segmenting extended to adaptive capacity.** Before implementing, checked for existing
+precedent rather than designing from scratch (per-request) — re-read
+`AdaptiveConcurrentIndexedTable` (Direction A's own concurrent top1Share tracking) closely,
+and found it likely has the identical sample-count-vs-sum bug fixed here (§4.6, flagged as a
+separate, undecided item — not fixed as part of this work). Its
+`DoubleAdder`/`DoubleAccumulator`/`AtomicInteger`-with-CAS pattern for the accumulator/max/tier
+fields is otherwise directly reusable and was ported as-is; the gate itself uses this class's
+own already-corrected, explicit `LongAdder` sample count, not a copy of Direction A's
+`_runningTotal.sum()`-based check.
+
+Design: `_runningMax`/`_runningTotal`/`_sampleCount`/`_currentTier` moved from plain
+`double[]`/`long[]`/`int[]` (safe only because every adaptive upsert held one single exclusive
+lock in the original, `numSubSegments=1`-only version of this class) to
+`DoubleAccumulator[]`/`DoubleAdder[]`/`LongAdder[]`/`AtomicInteger[]`, one slot per OUTER shard
+— now genuinely necessary, since multiple sub-segments of the same outer shard, each with its
+own independent lock, can call `updateSignal` concurrently. `_currentTier`'s CAS retry loop
+mirrors `AdaptiveConcurrentIndexedTable`'s exactly (monotonic shrink-only, safe against two
+sub-segments racing to advance the same shard's tier at once). The
+`adaptiveCapacity && numSubSegments > 1` constructor guard that used to throw is gone —
+replaced by making the combination genuinely safe rather than rejecting it.
+
+Verified correctness before measuring performance, same discipline as every prior concurrency
+change here: replaced the now-obsolete `testSubSegmentsRejectedForAdaptiveCapacity` (which
+tested the guard that no longer exists) with two new tests —
+`testAdaptiveCapacityWithSubSegmentsShrinksOnSkewedData` and
+`testAdaptiveCapacityWithSubSegmentsNoFalsePositiveOnUniformData`, extending the existing
+skew/uniform helpers with a `numSubSegments` parameter rather than duplicating them. 18 total
+clean runs (15 ad-hoc + 3 through real `mvn test`) before any performance measurement.
+
+Performance, measured on the skewed benchmark (adding
+`shardedOffHeapGroupTableAdaptiveSubSegmented4`): the first comparison had a real outlier (one
+iteration in `AdaptiveSubSegmented4`'s Fork 3 spiked to 55,961 us/op against a tight
+~50,000-50,745 band everywhere else in that fork) — not trusted, rerun. Clean the second time:
+
+| Benchmark | Score (avgt, us/op) |
+|---|---|
+| Adaptive (`numSubSegments=1`) | 53,453.597 ± 1,197.892 |
+| **Adaptive, sub-segmented (`numSubSegments=4`)** | **50,302.185 ± 305.670** |
+
+Sub-segmenting is **6.3% faster** for adaptive capacity too — the same lever that helped fixed
+capacity (6.9-8.1%) transfers, roughly matching in magnitude.
+
+**One honest, secondary finding this surfaced, not asked for but real**: `numSubSegments=1`
+adaptive capacity (now atomics-based) measured 53,454-54,097 us/op across two separate runs —
+consistently higher than the ~48,763-51,096 us/op range this same configuration measured at
+*before* this port, when it used plain fields. This is a cross-run comparison (different JMH
+invocations at different points in this investigation, not a same-run A/B test), so it isn't
+held to the same standard as the sub-segmenting win above — but the gap (~5-10%) is larger than
+the run-to-run drift seen elsewhere in this document for genuinely unmodified code (Direction
+A's own baseline has shown ~5% spread across clean runs). Plausible explanation: Direction A's
+own "~1.8ns/upsert, negligible" measurement for these same primitive types was made under real
+concurrent contention, where `DoubleAdder`/`DoubleAccumulator` are specifically designed to be
+cheap *relative to* a naive shared counter under contention — but at `numSubSegments=1`, every
+access is already serialized by the single exclusive lock, so there is no contention for the
+atomic types to be cheap *relative to*; their overhead here is closer to pure, unamortized cost.
+Not confirmed by profiling — noted as a real, secondary cost of this change, not swept under
+the sub-segmenting win.
+
 ### 6.6 Open questions
 
 - The adaptive-capacity gate (§6.5) is a flat, empirically-chosen sample-count constant
@@ -948,6 +1006,15 @@ many more shards) has not been tried and could plausibly need a smaller constant
   attempt) found a real correctness hazard in around concurrent resize — see the session notes
   for the
   reasoning; not pursued given sub-segmenting already delivered a real win at much lower risk.
+  Sub-segmenting was subsequently extended to adaptive capacity too (§6.5) — DoubleAdder/
+  DoubleAccumulator/AtomicInteger-with-CAS per outer shard, the same primitives
+  AdaptiveConcurrentIndexedTable already uses, with the corrected count-based gate rather than a
+  copy of that class's likely-buggy one (§4.6). `numSubSegments=4` is a real 6.3% win for
+  adaptive too, closely matching fixed capacity's own margin. Real, secondary, NOT yet resolved
+  finding from the same work: `numSubSegments=1` adaptive capacity, now atomics-based, measures
+  ~5-10% slower across two runs than the same configuration measured before this port when it
+  used plain fields — a cross-run comparison, not confirmed by profiling, but larger than this
+  document's own baseline for ordinary run-to-run drift.
 - Not wired into the query engine (same as both parent directions). A regression test suite now
   exists (`ShardedOffHeapGroupTableTest.java`, `pinot-core/src/test/java/org/apache/pinot/core/
   data/table/`) covering basic correctness, same-key-same-shard routing under real concurrent

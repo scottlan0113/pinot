@@ -207,13 +207,25 @@ public class ShardedOffHeapGroupTableTest {
     }
   }
 
-  @Test(expectedExceptions = IllegalArgumentException.class)
-  public void testSubSegmentsRejectedForAdaptiveCapacity() {
-    // Sub-segmenting is deliberately not extended to adaptive capacity yet (§6.2) -- the top1Share
-    // signal is tracked per OUTER shard and isn't safe to split across independently-locked
-    // sub-segments without its own concurrency treatment. Must fail loudly, not silently do the
-    // wrong thing.
-    new ShardedOffHeapGroupTable(NUM_SHARDS, 16, 5000, true, 4);
+  @Test
+  public void testAdaptiveCapacityWithSubSegmentsShrinksOnSkewedData()
+      throws Exception {
+    // Sub-segmenting was extended to adaptive capacity (§6.2) by moving the top1Share signal
+    // (runningTotal/sampleCount/runningMax/currentTier) to DoubleAdder/LongAdder/DoubleAccumulator/
+    // AtomicInteger-with-CAS, since multiple independently-locked sub-segments of the same OUTER shard
+    // can now update that shard's signal concurrently. This must produce the SAME adaptive behavior as
+    // numSubSegments=1 on the same skewed workload testAdaptiveCapacityShrinksOnSkewedData already
+    // covers: real memory reduction, recall@10 never worse than fixed.
+    SkewResult r = runZipfWorkload(1.0, 1_000_000, 5000, 4);
+    Assert.assertTrue(r._adaptiveSize < r._fixedSize,
+        "Expected real memory reduction at skew=1.0 with sub-segments, got fixed=" + r._fixedSize
+            + " adaptive=" + r._adaptiveSize);
+    Assert.assertTrue(r._adaptiveSize < r._fixedSize / 2,
+        "Expected a large reduction at skew=1.0 with sub-segments, only got fixed=" + r._fixedSize
+            + " adaptive=" + r._adaptiveSize);
+    Assert.assertEquals(r._recallFixed, 1.0);
+    Assert.assertEquals(r._recallAdaptive, 1.0,
+        "Adaptive capacity with sub-segments must never cost recall on the true top-10");
   }
 
   @Test
@@ -224,19 +236,36 @@ public class ShardedOffHeapGroupTableTest {
     // capacity. Any shrinkage here is a false positive.
     int cardinality = 50_000;
     int fullCapacity = 5000;
-    long fixedSize = runUniformWorkload(cardinality, fullCapacity, false);
-    long adaptiveSize = runUniformWorkload(cardinality, fullCapacity, true);
+    long fixedSize = runUniformWorkload(cardinality, fullCapacity, false, 1);
+    long adaptiveSize = runUniformWorkload(cardinality, fullCapacity, true, 1);
     Assert.assertEquals(adaptiveSize, fixedSize,
         "Adaptive capacity shrank on uniform, non-concentrated data -- the minimum-sample gate is "
             + "triggering on noise, not a real top1Share signal");
     Assert.assertEquals(adaptiveSize, cardinality);
   }
 
-  private long runUniformWorkload(int cardinality, int fullCapacity, boolean adaptiveCapacity)
+  @Test
+  public void testAdaptiveCapacityWithSubSegmentsNoFalsePositiveOnUniformData()
+      throws Exception {
+    // Same false-positive regression case as testAdaptiveCapacityNoFalsePositiveOnUniformData, but with
+    // numSubSegments=4 -- multiple sub-segments' threads racing to update the same shard's signal via
+    // DoubleAdder/LongAdder must not, itself, create spurious concentration (e.g. double-counting a
+    // sample, or a torn read of runningTotal/sampleCount) that looks like a real top1Share signal.
+    int cardinality = 50_000;
+    int fullCapacity = 5000;
+    long fixedSize = runUniformWorkload(cardinality, fullCapacity, false, 4);
+    long adaptiveSize = runUniformWorkload(cardinality, fullCapacity, true, 4);
+    Assert.assertEquals(adaptiveSize, fixedSize,
+        "Adaptive capacity with sub-segments shrank on uniform, non-concentrated data");
+    Assert.assertEquals(adaptiveSize, cardinality);
+  }
+
+  private long runUniformWorkload(int cardinality, int fullCapacity, boolean adaptiveCapacity,
+      int numSubSegments)
       throws Exception {
     ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
     try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 1_000_000 / NUM_SHARDS,
-        fullCapacity, adaptiveCapacity)) {
+        fullCapacity, adaptiveCapacity, numSubSegments)) {
       List<Future<?>> futures = new ArrayList<>();
       for (int t = 0; t < NUM_THREADS; t++) {
         long seed = 6000L + t;
@@ -296,10 +325,15 @@ public class ShardedOffHeapGroupTableTest {
 
   private SkewResult runZipfWorkload(double skew, int cardinality, int fullCapacity)
       throws Exception {
+    return runZipfWorkload(skew, cardinality, fullCapacity, 1);
+  }
+
+  private SkewResult runZipfWorkload(double skew, int cardinality, int fullCapacity, int numSubSegments)
+      throws Exception {
     double[] cdf = buildZipfCdf(cardinality, skew);
     Map<Integer, Double> groundTruth = new ConcurrentHashMap<>();
-    Map<Integer, Double> fixedResult = runZipfTable(cdf, fullCapacity, false, groundTruth);
-    Map<Integer, Double> adaptiveResult = runZipfTable(cdf, fullCapacity, true, null);
+    Map<Integer, Double> fixedResult = runZipfTable(cdf, fullCapacity, false, numSubSegments, groundTruth);
+    Map<Integer, Double> adaptiveResult = runZipfTable(cdf, fullCapacity, true, numSubSegments, null);
 
     List<Integer> trueTop10 = topKKeys(groundTruth, 10);
     SkewResult r = new SkewResult();
@@ -311,12 +345,12 @@ public class ShardedOffHeapGroupTableTest {
   }
 
   private Map<Integer, Double> runZipfTable(double[] cdf, int fullCapacity, boolean adaptiveCapacity,
-      Map<Integer, Double> groundTruthOut)
+      int numSubSegments, Map<Integer, Double> groundTruthOut)
       throws Exception {
     ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
     boolean recordGroundTruth = groundTruthOut != null;
     try (ShardedOffHeapGroupTable table = new ShardedOffHeapGroupTable(NUM_SHARDS, 1024, fullCapacity,
-        adaptiveCapacity)) {
+        adaptiveCapacity, numSubSegments)) {
       List<Future<?>> futures = new ArrayList<>();
       for (int t = 0; t < NUM_THREADS; t++) {
         long seed = 9000L + t;
