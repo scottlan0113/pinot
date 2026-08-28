@@ -687,6 +687,58 @@ explanation consistent with the numbers, not a measured mechanism. Net: sub-segm
 been checked on both workload shapes this document uses throughout, and helps substantially in
 both — `numSubSegments=4` is not a skew-specific trick.
 
+**Root cause of the K=16/32 regression found 2026-08-28 (the "still genuinely unknown" question
+this section left open).** The refuted hypothesis above tested giving EVERY sub-segment
+(0 through K-1) full undivided capacity, which conflated two different things: (a) segment 0
+specifically, which is the single-threaded MERGE TARGET in `finishAllShards()` and starts
+undersized at `perShardInitialCapacity / numSubSegments` — tiny at K=16/32 — and (b) segments
+1..K-1, which only ever need to hold their own share during the CONCURRENT phase and don't
+individually benefit much from more capacity. Giving *all* of them full capacity blew up total
+initial off-heap allocation (32x at K=32) and made the CONCURRENT phase dramatically slower,
+which is what that experiment actually measured — it never isolated segment 0's role.
+
+A dedicated diagnostic (not a permanent JMH benchmark — manual `System.nanoTime()` timing
+around `finishAllShards()` alone, 7 trials per configuration with the first 2 discarded as
+warmup, same 64-shard/1M-cardinality/skew=1.0/1M-upsert parameters as the skewed benchmark)
+isolated `finishAllShards()`'s own cost from the concurrent-upsert phase entirely, and measured
+it against the number of DISTINCT keys actually needing to be merged (computed exactly from the
+same key sequence, not estimated):
+
+| `numSubSegments` | finish time (divided, current default) | records needing merge | finish time (undivided) |
+|---|---|---|---|
+| 4 | 1.352ms | 162,593 | 1.638ms |
+| 8 | 3.500ms | 189,705 | 1.776ms |
+| 16 | 4.897ms | 203,227 | 1.847ms |
+| 32 | 6.037ms | 210,160 | 2.180ms |
+
+Under the current (divided) default, finish time grows **4.4x** from K=4 to K=32 while the
+merge volume grows only **1.29x** — clearly super-linear, not explained by "more records to
+merge" alone. Rebuilding the SAME diagnostic with `divideInitialCapacityAcrossSubSegments=false`
+— which gives every sub-segment, segment 0 included, the full undivided capacity — brings finish
+time down to growing **1.33x** from K=4 to K=32, now tracking the 1.29x growth in merge volume
+almost exactly (roughly linear, as merging distinct records into an already-adequately-sized
+target should be).
+
+**Conclusion**: the K=16/32 regression is real and IS a resize-frequency effect, just not the
+one originally hypothesized — not resize DURING the concurrent phase (refuted above), but
+resize of segment 0 specifically DURING the single-threaded merge, because segment 0 starts at
+only `perShardInitialCapacity / numSubSegments` (tiny at high K) and has to repeatedly
+`growData()`/`growIndex()` (each a full reallocate-and-copy) while absorbing the other K-1
+sub-segments' worth of data into itself. This finish-phase cost is a real, substantial fraction
+of the total: at K=32 it's ~6ms out of a ~46ms total op time in the full skewed benchmark
+(~13%), vs. ~1.35ms out of ~42.5ms at K=4 (~3%) — enough on its own to plausibly explain most
+or all of the K=16/32 regression, though this diagnostic measured `finishAllShards()` in
+isolation and did not re-run the full concurrent+finish benchmark to confirm the total effect
+size matches exactly.
+
+**Not yet attempted**: an ASYMMETRIC capacity scheme — give segment 0 alone the full,
+undivided capacity (since it is the eventual home for the whole shard's distinct keys either
+way) while segments 1..K-1 keep the small, divided capacity (since they only ever need to hold
+their own transient share) — was not implemented or benchmarked end-to-end. This is now a
+concretely motivated next step, not a guess: it targets exactly the mechanism this diagnostic
+confirmed, without reintroducing the over-allocation cost that made the all-undivided
+experiment regress so badly.
+
 ### 6.3 Correctness: real concurrent threads, not simulation
 
 Every Direction B measurement (§5) used *simulated* per-thread tables — one thread at a time,
@@ -1019,11 +1071,17 @@ the sub-segmenting win.
   sweep found this does NOT keep improving with larger `numSubSegments`: 8 is back near the
   baseline, 16/32 are measurably worse than never sub-segmenting at all — non-monotonic, not
   diminishing returns. The "smaller per-sub-segment capacity causes more frequent resize"
-  hypothesis for that regression was tested directly and REFUTED (giving every sub-segment full
-  undivided capacity made K=16/32 dramatically *worse*, not better, since it also scales total
-  allocation with `numSubSegments`) — why K=16/32 regress at a properly constant total capacity
-  is still genuinely unknown, not just unconfirmed. `numSubSegments=4` remains the recommended
-  default regardless. A fully lock-free scheme (no `ReentrantReadWriteLock` at all) remains a
+  hypothesis for that regression was tested directly and REFUTED in its original form (giving
+  EVERY sub-segment full undivided capacity made K=16/32 dramatically *worse*, not better, since
+  it also scales total allocation with `numSubSegments`) — but a follow-up diagnostic (§6.2's
+  "Root cause... found 2026-08-28") found a narrower, real version of the same idea IS the
+  cause: segment 0 specifically (the single-threaded merge target in `finishAllShards()`) starts
+  undersized at high K and has to repeatedly grow while absorbing every other sub-segment's
+  data, a real and substantial cost (~13% of total op time at K=32, isolated via manual timing)
+  that a targeted undivided-vs-divided comparison confirmed directly. Not yet acted on: an
+  asymmetric scheme (segment 0 alone gets full capacity, 1..K-1 stay small) is a concretely
+  motivated fix, not implemented. `numSubSegments=4` remains the recommended default regardless
+  of whether that fix is ever built. A fully lock-free scheme (no `ReentrantReadWriteLock` at all) remains a
   different, unexplored, higher-risk idea that a design-phase review (not yet an implementation
   attempt) found a real correctness hazard in around concurrent resize — see the session notes
   for the
