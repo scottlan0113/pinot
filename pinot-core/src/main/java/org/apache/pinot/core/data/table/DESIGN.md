@@ -1046,44 +1046,58 @@ the sub-segmenting win.
   across shards, same as Direction A) — worth stating explicitly since it's easy to
   incorrectly assume Direction B's duplication numbers (§5.5) carry over.
 
-## 7. Open decision
+## 7. Recommendation: Direction C
 
-No decision has been made among Direction A (sharding + adaptive capacity), Direction B
-(per-thread + off-heap), and Direction C (sharding + off-heap, §6) — all three are now
-characterized on real implementations across the same three axes:
+Per Jackie's explicit request to weigh all three directions and reach a recommendation through
+rigorous testing, not leave this open indefinitely — all three are now characterized on real
+implementations across the same axes:
 
 | | A: sharding + adaptive capacity | B: per-thread + off-heap | C: sharding + off-heap |
 |---|---|---|---|
 | Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed under both uniform and skewed workloads: fixed capacity 1.81-3.00x faster (3.00x with sub-segmenting on uniform data, its biggest measured margin, §6.2), adaptive capacity 1.09-1.95x faster (wider margin under the skew #10498 targets) + ~0 GC vs. Direction A itself (§6.4) |
-| Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
-| Correctness risk | None found (§4.5) | Real: recall@10 drops to 62-92% at mild skew (§5.7), unmitigated | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3) |
+| Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) — **but see the caveat below: this signal likely has the same unverified-under-realistic-values gap Direction C's own port had, not yet fixed or re-confirmed in Direction A itself (§4.6)** | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) with the corrected gate — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A's claimed numbers; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
+| Correctness risk | None found (§4.5), but see the memory-row caveat — the verification behind "none found" may itself need redoing | **Real, confirmed, unmitigated**: recall@10 drops to 62-92% at mild skew (§5.7), as low as 0% in the worst case, reproducing the original `ShardSizeCalibration` finding that motivated sharding in the first place | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3), unaffected by the gate bug (Direction C's own gate was already fixed and re-verified) |
 | Wired into query engine | No (§4.6) | No (§5.8) | No (§6.6) |
 | Regression tests | No (§4.6) | No (§5.8) | Yes — `ShardedOffHeapGroupTableTest.java`, runs under `mvn test` (§6.6) |
 
-**Direction C currently looks like the strongest candidate**: it inherits Direction A's
-correctness guarantee exactly (confirmed, not just argued by analogy — §6.3), its performance
-comparison is now JMH-confirmed under both a uniform and a skewed workload, and it now has
-Direction A's adaptive-capacity idea ported for the memory-ceiling problem (§4.2) with memory
-numbers matching Direction A's own (§6.5) — two real gate-tuning bugs were found and fixed
-along the way, both verified against a uniform and a skewed workload together, not just
-whichever one motivated the fix. It also now has a permanent regression suite, unlike either
-parent direction. Adaptive capacity's wall-clock margin over Direction A got *less* flattering
-under rigor on uniform data (~9%, not the ~1.5x ad-hoc numbers suggested) but recovered to
-~1.95x under the skewed workload #10498 actually targets — the memory-reduction benefit does
-buy back most (not quite all) of the bookkeeping cost once it has skew to work with (§6.4).
-Direction B's standalone results remain useful as the underlying evidence that off-heap storage
-genuinely lowers GC pressure and that duplication does not erase that benefit (§5.5-§5.6) — but
-as a complete design, Direction B carries a correctness risk that Direction C does not, for what
-was (in this comparison) *better* performance, not worse — which weakens the case for choosing
-plain Direction B over Direction C specifically. The write-lock-per-upsert design (§6.2) is also
-no longer just an unexamined simplification — it was directly compared against a finer-grained
-read-write-split alternative and won, then improved further (not just defended) by
-sub-segmenting each shard while keeping that same exclusive-lock model, a real 6.9-8.1% win.
-The numbers above reflect a design that was tested against its own obvious alternatives, not
-merely the first thing that worked. Next step is Jackie's input on which direction(s) to keep
-pursuing — most plausibly Direction C, with
-query-engine wiring as the concrete remaining work before it's ready to compare against
-Direction A on fully equal footing.
+**Recommendation: Direction C, with `numSubSegments=4` sub-segmenting applied to both fixed and
+adaptive capacity (§6.2).** Reasoning, axis by axis:
+
+- **Correctness first, since it's the one axis that isn't a tradeoff.** Direction B is
+  disqualified here, not merely deprioritized: its recall risk is real, confirmed, and
+  unmitigated, and reproduces the exact failure mode ("simple" per-thread trim-before-merge)
+  that motivated sharding in the first place (§4.2, §5.2). A design that can silently return
+  wrong top-K results under realistic skew is not viable regardless of its performance or GC
+  characteristics, unless a mitigation is found — none has been attempted. Direction A and C
+  both have the same key-hash-routing guarantee and no correctness risk found — but Direction
+  A's own adaptive-capacity verification needs to be redone in light of the likely gate bug
+  found while researching this recommendation (§4.6); Direction C's equivalent bug was found,
+  fixed, and independently re-verified against both a uniform and a skewed workload together.
+- **Performance now clearly favors C.** Every configuration measured has Direction C faster than
+  Direction A, from a conservative ~9% (adaptive, uniform workload, no sub-segmenting) up to
+  3.00x (fixed capacity, sub-segmented, uniform workload) — and C's write-lock design was
+  directly compared against a finer-grained alternative (lost) and then improved via
+  sub-segmenting (won, substantially) rather than left as an unexamined simplification.
+- **Memory ties, once Direction A's own gate is fixed and re-verified** — same signal, same
+  thresholds, same shrink behavior, ported deliberately to match. Until that re-verification
+  happens, Direction C's numbers are the ones with fresher, more trustworthy confirmation.
+- **Operational cost is the one place Direction A is simpler**: on-heap only, no off-heap Arena
+  lifecycle to manage. This is a real, non-zero cost of choosing C, though nothing has actually
+  gone wrong with it across the extensive concurrency testing in §6.3/§6.2's sub-segmenting work.
+
+Direction B's standalone results remain useful as evidence that off-heap storage genuinely
+lowers GC pressure and that duplication does not erase that benefit (§5.5-§5.6) — worth keeping
+as a reference finding even though the complete design is not recommended.
+
+**What "rigorous" covers here, and what it doesn't**: every number above comes from JMH (3
+forks x 5 iterations, outliers checked per-fork before trusting any comparison) and real
+concurrent-thread correctness tests against an independent ground truth — not simulation, not
+single-run measurements. What it does NOT cover: real Pinot query patterns (everything is a
+synthetic benchmark), Pinot's actual combine-phase thread count (`NUM_SEGMENTS=10` throughout
+is this investigation's own choice, not measured from production), or wiring into the query
+engine at all. This recommendation is "Direction C wins decisively among these three
+prototypes, tested as rigorously as a prototype can be" — not "Direction C is proven in
+production," which is what query-engine wiring and Jackie's sign-off would establish next.
 
 ## 8. A note on benchmark rigor
 
