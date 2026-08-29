@@ -124,6 +124,11 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   private final Arena _arena;
   private final OffHeapGroupTable[][] _shards; // [outer shard][sub-segment]
   private final ReentrantReadWriteLock[][] _locks; // [outer shard][sub-segment]
+  // Set during finishAllShards() (sequential across shards, see its own Javadoc, so a plain boolean is
+  // safe -- no concurrent writers). Lets a caller ask "did any shard actually discard records," the
+  // signal IndexedTable.isTrimmed() reports for the on-heap tables (ShardedOffHeapIndexedTable needs
+  // this to implement that same contract).
+  private boolean _anyShardTrimmed;
 
   // Adaptive-capacity bookkeeping, one slot per OUTER shard -- shared across that shard's
   // sub-segments, which each hold their own independent lock, so these must be genuinely
@@ -425,13 +430,22 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
             }
           }
         }
-        primary.trimTo(capacityFor(i));
+        if (primary.trimTo(capacityFor(i))) {
+          _anyShardTrimmed = true;
+        }
       } finally {
         for (int j = 0; j < _numSubSegments; j++) {
           _locks[i][j].writeLock().unlock();
         }
       }
     }
+  }
+
+  /// Valid post-finishAllShards() only. True if trimming actually discarded records on at least one
+  /// shard -- false if every shard's final size was already at or under its capacity, in which case
+  /// nothing was lost regardless of capacity/adaptive-capacity settings.
+  public boolean anyShardTrimmed() {
+    return _anyShardTrimmed;
   }
 
   /// Valid post-finishAllShards() only -- see forEachEntry().

@@ -1325,6 +1325,75 @@ cost as the old hardcoded `existing + value`, presumably via monomorphic inlinin
 `SUM` is ever exercised in these benchmarks) — the existing SUM-only numbers throughout this
 document remain valid as reported, not merely assumed to be.
 
+### 6.9 Query-engine wiring: Path 1 prototype (2026-08-29)
+
+Follow-up to apache/pinot#19388's design doc, specifically Path 1 (the narrow adapter approach).
+Built the actual adapter class and tested it against real Pinot objects — not a real end-to-end
+query through `GroupByCombineOperator` (still not wired in, no decision from Jackie yet), but a
+real step up from "standalone construction with synthetic int/double inputs," the level every
+other verification in this document has used so far.
+
+**Two corrections to the design doc's own Path 1 sketch, found by reading the real integration
+points rather than assumed:**
+
+1. "Widen `GroupByCombineOperator._indexedTable` to `Table`" is not sufficient by itself.
+   `GroupByResultsBlock`'s own constructor also requires the concrete `IndexedTable` type (an
+   abstract class, not just the `Table` interface) — `IndexedTable indexedTable = _indexedTable;
+   ... new GroupByResultsBlock(indexedTable, _queryContext)`. The new adapter class,
+   `ShardedOffHeapIndexedTable`, extends `IndexedTable` directly instead. `IndexedTable`'s
+   inherited upsert/finish/resize machinery is built entirely around `Map<Key, Record>` +
+   `TableResizer`, which this class does not use at all (a genuinely different implementation
+   sharing the base class purely for type-compatibility, not a generalization of it) — every
+   substantive method is overridden, and the required `Map<Key, Record>` constructor argument is
+   `Map.of()`, permanently empty and never touched.
+2. Eligibility is narrower than "int keys, SUM/MIN/MAX aggregate" alone implies. Pinot's real
+   GROUP BY can have more than one aggregation function in a single query (e.g. `SELECT SUM(a),
+   MIN(b) ... GROUP BY c`) — `GroupByCombineOperator` lays out one record slot per aggregation
+   function after the key columns. `ShardedOffHeapGroupTable` stores exactly one `double` per
+   key, so it has no way to represent that at all, regardless of whether every individual
+   function is SUM/MIN/MAX. `ShardedOffHeapIndexedTable.isEligible(DataSchema, QueryContext)`
+   requires **exactly one** aggregation function, of type SUM/MIN/MAX, over all-INT GROUP BY key
+   columns — real eligibility is the intersection of all three conditions, not just the aggregate
+   type. `ineligibilityReason(...)` returns *why* rather than a bare boolean, specifically so a
+   future caller wiring this into `GroupByUtils` can log/measure how much real traffic falls
+   outside this scope — one of the design doc's own open questions.
+
+**Verification**: 6 new tests in `ShardedOffHeapIndexedTableTest.java`, using real `QueryContext`
+objects parsed from actual SQL (`QueryContextConverterUtils.getQueryContext(...)`, the same
+pattern the benchmark classes already use) and real `DataSchema`/`Key`/`Record` objects — not the
+synthetic int/double inputs every other test in this document exercises Direction C with. Covers
+basic upsert/merge, `finish(sort=true, ...)`'s descending-by-aggregate-value behavior, MIN and MAX
+(not just SUM), multi-column keys through the `Key`/`Record` boundary, three distinct
+ineligibility cases (two aggregation functions, a non-SUM/MIN/MAX function, a STRING key column)
+correctly rejected with a clear reason, and real-concurrent-thread same-key-same-shard routing
+against an independent ground truth (mirroring `ShardedOffHeapGroupTableTest`'s own discipline,
+but exercised through the new `Key`/`Record` boundary this class adds rather than
+`ShardedOffHeapGroupTable`'s int/double API directly). One real bug caught immediately by
+running the tests, not by inspection: `System.arraycopy` cannot bulk-box `int[]` into `Object[]`
+for the multi-column `Record` path — fixed with an element-by-element copy loop. All 6 new tests
+plus the existing 21 clean across 4 runs; existing suite unaffected.
+
+**A small, genuinely useful addition to `ShardedOffHeapGroupTable` fell out of this work**:
+`OffHeapGroupTable.trimTo(int)` now returns whether it actually discarded anything (previously
+`void`), aggregated up into `ShardedOffHeapGroupTable.anyShardTrimmed()` — needed because
+`IndexedTable.isTrimmed()` is part of the real contract `GroupByCombineOperator` calls, and
+nothing before this tracked that signal.
+
+**Known gaps, deliberately not solved** (this is a prototype demonstrating the core data-flow is
+sound, not a production-ready implementation — see the class's own Javadoc for the same list):
+`finish(sort=true, ...)` sorts descending by the single aggregate value only, not a real
+`TableResizer`-equivalent general ORDER BY comparator (arbitrary expressions, ascending order,
+ordering by key columns are all unsupported); `getNumResizes()`/`getResizeTimeMs()` are coarse
+(a 0-or-1 count and an untracked 0ms, since `ShardedOffHeapGroupTable` only reports a boolean,
+not a count or timing breakdown); and the Arena/native-memory lifecycle risk the design doc
+already flagged as an open question is unchanged — `close()` runs at the end of `finish()`, so a
+query that errors out or times out before reaching that point would leak the off-heap Arena, a
+risk this prototype surfaces again rather than resolves.
+
+**Still not wired into `GroupByUtils`/`GroupByCombineOperator`** — this section closes the "does
+the core adapter idea actually work against real Pinot types" question, not the "should we ship
+this" one, which stays with Jackie per the design doc's own framing.
+
 ## 7. Recommendation: Direction C
 
 Per Jackie's explicit request to weigh all three directions and reach a recommendation through

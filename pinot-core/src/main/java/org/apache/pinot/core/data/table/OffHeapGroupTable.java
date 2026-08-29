@@ -238,9 +238,12 @@ public class OffHeapGroupTable implements AutoCloseable {
   /// Trims down to the top `topK` records by value (descending), discarding the rest. Mirrors
   /// TableResizer's role for the on-heap tables -- a full sort here since per-thread tables are expected
   /// to be small enough (already trimmed segment-level results) that this is not the hot path.
-  public void trimTo(int topK) {
+  /// Returns whether anything was actually discarded -- callers that need to report an IndexedTable-style
+  /// isTrimmed() signal (see ShardedOffHeapIndexedTable) need this, since a no-op call (already at or
+  /// under capacity) is not the same as a real trim.
+  public boolean trimTo(int topK) {
     if (_size <= topK) {
-      return;
+      return false;
     }
     // Sort descending by value with zero boxing: java.util.Arrays.sort only accepts a Comparator for
     // Object[], not double[]/int[], so a naive fix would box into Double[]/Integer[] -- which just moves
@@ -277,6 +280,7 @@ public class OffHeapGroupTable implements AutoCloseable {
         insertHashIntoIndex(hashKeysAt(slot), slot);
       }
     }
+    return true;
   }
 
   public int size() {
