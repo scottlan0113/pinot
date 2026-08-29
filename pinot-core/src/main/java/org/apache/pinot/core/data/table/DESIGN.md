@@ -1426,6 +1426,45 @@ previously-verified behavior.
 the core adapter idea actually work against real Pinot types" question, not the "should we ship
 this" one, which stays with Jackie per the design doc's own framing.
 
+**JMH benchmark through the real `Key`/`Record` boundary, 2026-08-29.** Every prior Direction C
+number in this document (§6.1-6.8) measured `ShardedOffHeapGroupTable`'s own raw
+`upsert(int, double)` API directly — never through the `Key`/`Record` objects a real query
+actually passes. New benchmark class `BenchmarkShardedOffHeapIndexedTable`
+(`pinot-perf/src/main/java/org/apache/pinot/perf/`), uniform workload, cardinality 50,000,
+10 threads × 100,000 upserts each, `ORDER BY sum(m1) DESC LIMIT 500` (so `_hasOrderBy=true`,
+exercising the real order-by code path on both sides), 3 forks × 5 iterations, fresh
+`pinot-core` install first to avoid a stale-classpath issue hit earlier in this investigation:
+
+| Benchmark | Score (us/op) | What it measures |
+|---|---|---|
+| `concurrentIndexedTable` | 416,403.2 ± 8,118.5 | `ConcurrentIndexedTable` — what `GroupByUtils` actually picks in production today for this query shape |
+| `shardedOffHeapIndexedTable` | 23,558.6 ± 615.4 | The Path 1 adapter, through its real `upsert(Key, Record)` API |
+| `shardedOffHeapGroupTableDirect` | 15,401.5 ± 310.2 | `ShardedOffHeapGroupTable`'s raw `upsert(int, double)`, no `Key`/`Record` at all |
+
+Verified consistent across all 3 independent forks before trusting it (per this document's own
+standing discipline of not trusting a single/surprising run) — no fork or iteration is an outlier
+for any of the three benchmarks; `concurrentIndexedTable` ranges 406,500-431,575 us/op across all
+15 iterations, tight around the mean.
+
+- **`Key`/`Record` boundary cost**: 23,558.6 / 15,401.5 ≈ **1.53x** — real, measurable overhead
+  from per-upsert `Object[]` boxing and the one-time `Map<Key, Record>` build in `finish()`, but
+  small relative to the next number.
+- **Path 1 adapter vs. today's real production baseline**: 416,403.2 / 23,558.6 ≈ **17.7x**. This
+  margin is substantially wider than the ~6.9x `ShardedOffHeapGroupTable`-direct-vs-baseline
+  number elsewhere in this document (§4.5) — not a contradiction, since that number and this one
+  measure different things (different harness, different cardinality/thread shape, and critically
+  §4.5's baseline is a different comparison point than plain `ConcurrentIndexedTable` under this
+  exact 10-thread/50K-cardinality/order-by-enabled shape, which had not been measured before in
+  this investigation). Plausible mechanism, not yet independently confirmed by profiling:
+  `ConcurrentIndexedTable` funnels all 10 threads through one `ReentrantReadWriteLock` guarding one
+  shared map on every single upsert (1,000,000 total), while the sharded design spreads that same
+  work across `NUM_SHARDS=64` shards (each further split into `DEFAULT_NUM_SUB_SEGMENTS=4`) — this
+  matches a cost driver already identified earlier in this investigation, that
+  `ReentrantReadWriteLock`'s per-call overhead is a real fixed cost, not just a contention effect.
+- No resize occurred on the `ConcurrentIndexedTable` side during this run (cardinality 50,000 stays
+  well under `TRIM_THRESHOLD=1,000,000`), so the gap reflects steady-state upsert cost, not
+  resize/trim behavior.
+
 ## 7. Recommendation: Direction C
 
 Per Jackie's explicit request to weigh all three directions and reach a recommendation through
