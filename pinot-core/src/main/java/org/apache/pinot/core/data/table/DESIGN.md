@@ -187,7 +187,11 @@ per-thread simple design; enabling adaptive capacity on top of sharding costs no
 additional time (bookkeeping overhead is within noise) — sharding accounts for essentially
 all of the speedup, and adaptive capacity's contribution is to memory, not latency.
 
-**Memory** (entries held before final merge, real classes):
+**Memory** (entries held before final merge, real classes). **Caveat added 2026-08-29: the mild-skew
+row below was re-spot-checked under realistic (non-constant) values after a gate bug was fixed (§4.6)
+— see that section for the full before/after. Under the pre-fix code, mild-skew data with realistic
+values collapsed to a small capacity with recall dropping to 20-30%, the opposite of "no risk" this
+row claims; post-fix, this table's original numbers hold.**
 
 | Skew | Cardinality | Fixed capacity | Adaptive capacity | Reduction |
 |---|---|---|---|---|
@@ -232,21 +236,49 @@ keeping full capacity per shard in the first place (§4.2).
   `ShardedIndexedTable`.
 - No regression test suite yet — verification so far is ad-hoc scratch scripts, not
   committed tests. This should exist before proposing a real PR.
-- **Found 2026-08-27, NOT yet fixed, NOT yet confirmed against a realistic-value workload**:
-  `AdaptiveConcurrentIndexedTable`'s minimum-sample gate (`updateSignalAndMaybeShrink`) checks
-  `_runningTotal.sum() < MIN_SAMPLES_BEFORE_ADAPTATION` — comparing a **sum** of upserted
-  values against a **sample-count**-shaped threshold. This is the identical bug class Direction
-  C's own port of this signal had (§6.5), fixed there with an explicit sample counter separate
-  from the value sum. Every verification in §4.5 above used a workload where this coincidentally
-  doesn't matter (found by code inspection while researching precedent for Direction C's
-  adaptive-capacity sub-segment port, not by re-running Direction A's own tests with a
-  non-unit-valued workload — that confirmation step hasn't been done). If confirmed, this would
-  mean the memory-reduction and recall numbers in §4.5 need re-verification under a realistic
-  (non-1.0-valued) workload before being relied on as-is, the same way Direction C's original
-  numbers needed re-verification after this bug class was found there. Not fixed here yet —
-  flagged for a decision (fix now vs. defer) rather than silently patched, since §4.5's numbers
-  have already been reported externally and a fix would need those claims revisited, not just
-  the code.
+- **Found 2026-08-27, FIXED 2026-08-29**: `AdaptiveConcurrentIndexedTable`'s minimum-sample gate
+  (`updateSignalAndMaybeShrink`) checked `_runningTotal.sum() < MIN_SAMPLES_BEFORE_ADAPTATION` —
+  comparing a **sum** of upserted values against a **sample-count**-shaped threshold. The
+  identical bug class Direction C's own port of this signal had (§6.5), fixed there with an
+  explicit sample counter separate from the value sum — fixed here the same way, with a new
+  `_sampleCount` (`LongAdder`, incremented once per upsert). Verified red (new
+  `ShardedIndexedTableTest.testAdaptiveCapacityDoesNotShrinkOnLowSampleCountEvenWithLargeValues`
+  fails on the pre-fix code, 50 expected vs. 20 found) then green, 3 clean reruns, no regression
+  to Direction C's 30 existing tests. This is also Direction A's first real `mvn test` regression
+  coverage (`ShardedIndexedTableTest.java`, previously ad-hoc scratch scripts only).
+  <br><br>
+  **Confirmed impact, not just a theoretical concern**: a targeted spot-check (not a full re-run
+  of §4.5's whole sweep) using `git worktree` to compare the commit right before this fix against
+  right after, same skew/cardinality as §4.5's cardinality=320K rows but with realistic
+  (`random.nextDouble()*100`) values instead of the constant `1.0` every value-signal-adjacent
+  diagnostic script found in this session's scratchpad happened to use (the exact condition under
+  which this bug is invisible — still not confirmed with certainty that §4.5's original numbers
+  themselves used constant 1.0, since that original verification script no longer exists to
+  inspect, but this is the only pattern found and it matches every symptom). Two independent
+  random seeds, both showing the same shape:
+
+  | Skew | Metric | Pre-fix (buggy) | Post-fix | §4.5's original claim |
+  |---|---|---|---|---|
+  | 0.15 (mild) | reduction | **97.4-97.5%** | 0.0% | ~0% ("by design") |
+  | 0.15 (mild) | recall@10 | **0.20-0.30** | 1.00 | 100% |
+  | 1.00 | reduction | 94.6-94.7% | 94.7-95.0% | 94.8% |
+  | 1.00 | recall@10 | 1.00 | 1.00 | 100% |
+
+  Skew=1.00's numbers were never meaningfully wrong (real shrinkage still worked, matching §4.5's
+  claim within normal run-to-run variation). **Skew=0.15 is where the bug actually bit**: under
+  realistic non-constant values, a single large-valued upsert could make top1Share look
+  concentrated after only a handful of samples, collapsing mild-skew data — the exact regime §4.5
+  calls safe by design — to a small capacity almost as aggressively as genuinely skewed data, with
+  recall dropping to 20-30%. If §4.5's own original numbers were produced under constant-valued
+  data (unconfirmed but circumstantially likely), the "~0% reduction, no correctness risk" claim
+  already reported to Jackie would not have held under a realistic production workload. Post-fix,
+  the spot-check matches §4.5's original claims on both metrics at both skew levels.
+  <br><br>
+  **Not done**: a full re-run of §4.5's entire sweep (all 3 skew levels x all 4 cardinalities,
+  320K-20M) — this spot-check used only the cheapest cardinality point (320K) at two skew levels
+  (0.15, 1.00) chosen to bracket the "should be safe" vs. "should shrink" regimes. Whether to
+  redo the full table before this reaches Jackie again is a reporting decision, not a technical
+  one — raised, not resolved, here.
 
 ## 5. Direction B: per-thread tables + off-heap (initial prototype)
 
