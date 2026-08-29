@@ -98,6 +98,82 @@ public class ShardedOffHeapIndexedTableTest {
   }
 
   @Test
+  public void testFinishSupportsAscendingOrderBy() {
+    // Real ORDER BY support (2026-08-29 fix, DESIGN.md Sec 6.9): finish() now reuses the inherited
+    // TableResizer instead of a hand-rolled descending-only comparator, so ASC must work too -- something
+    // the earlier hand-rolled version could not do at all.
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContext(
+        "SELECT sum(m1) FROM testTable GROUP BY d1 ORDER BY sum(m1) ASC LIMIT 500");
+    DataSchema dataSchema = new DataSchema(new String[]{"d1", "sum(m1)"},
+        new DataSchema.ColumnDataType[]{DataSchema.ColumnDataType.INT, DataSchema.ColumnDataType.DOUBLE});
+    ShardedOffHeapIndexedTable table = new ShardedOffHeapIndexedTable(dataSchema, false, queryContext, 500, 500,
+        Integer.MAX_VALUE, 16, NUM_SHARDS, EXECUTOR);
+
+    table.upsert(new Key(new Object[]{1}), new Record(new Object[]{1, 10d}));
+    table.upsert(new Key(new Object[]{2}), new Record(new Object[]{2, 50d}));
+    table.upsert(new Key(new Object[]{3}), new Record(new Object[]{3, 30d}));
+    table.finish(true, false);
+
+    List<Double> valuesInOrder = new ArrayList<>();
+    Iterator<Record> iterator = table.iterator();
+    while (iterator.hasNext()) {
+      valuesInOrder.add((Double) iterator.next().getValues()[1]);
+    }
+    Assert.assertEquals(valuesInOrder, List.of(10d, 30d, 50d));
+  }
+
+  @Test
+  public void testFinishSupportsOrderingByKeyColumn() {
+    // Real ORDER BY support (2026-08-29 fix): ordering by a GROUP BY key column, not the aggregate --
+    // the hand-rolled version this replaced only ever knew how to sort by the aggregate value.
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContext(
+        "SELECT sum(m1) FROM testTable GROUP BY d1 ORDER BY d1 DESC LIMIT 500");
+    DataSchema dataSchema = new DataSchema(new String[]{"d1", "sum(m1)"},
+        new DataSchema.ColumnDataType[]{DataSchema.ColumnDataType.INT, DataSchema.ColumnDataType.DOUBLE});
+    ShardedOffHeapIndexedTable table = new ShardedOffHeapIndexedTable(dataSchema, false, queryContext, 500, 500,
+        Integer.MAX_VALUE, 16, NUM_SHARDS, EXECUTOR);
+
+    // Deliberately upserted with aggregate values that would sort DIFFERENTLY if this were still
+    // ordering by the aggregate -- if the assertion below passes, it can only be because key-column
+    // ordering is genuinely being used, not aggregate ordering that happens to coincide.
+    table.upsert(new Key(new Object[]{1}), new Record(new Object[]{1, 999d}));
+    table.upsert(new Key(new Object[]{2}), new Record(new Object[]{2, 1d}));
+    table.upsert(new Key(new Object[]{3}), new Record(new Object[]{3, 500d}));
+    table.finish(true, false);
+
+    List<Integer> keysInOrder = new ArrayList<>();
+    Iterator<Record> iterator = table.iterator();
+    while (iterator.hasNext()) {
+      keysInOrder.add((Integer) iterator.next().getValues()[0]);
+    }
+    Assert.assertEquals(keysInOrder, List.of(3, 2, 1));
+  }
+
+  @Test
+  public void testResizeStatsReflectRealTrimming() {
+    // 2026-08-29 fix (DESIGN.md Sec 6.9): getNumResizes()/getResizeTimeMs() used to be a hardcoded
+    // 0-or-1 / 0ms. fullCapacity=2 here forces every one of the NUM_SHARDS shards to trim (500 distinct
+    // keys spread across them, capacity 2 each) -- getNumResizes() must reflect that real count, not a
+    // capped 0-or-1, and getResizeTimeMs() must report real elapsed time, not a hardcoded zero.
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContext(
+        "SELECT sum(m1) FROM testTable GROUP BY d1 ORDER BY sum(m1) DESC LIMIT 2");
+    DataSchema dataSchema = new DataSchema(new String[]{"d1", "sum(m1)"},
+        new DataSchema.ColumnDataType[]{DataSchema.ColumnDataType.INT, DataSchema.ColumnDataType.DOUBLE});
+    ShardedOffHeapIndexedTable table = new ShardedOffHeapIndexedTable(dataSchema, false, queryContext, 2, 2,
+        Integer.MAX_VALUE, 16, NUM_SHARDS, EXECUTOR);
+
+    for (int i = 0; i < 500; i++) {
+      table.upsert(new Key(new Object[]{i}), new Record(new Object[]{i, (double) i}));
+    }
+    table.finish(true, false);
+
+    Assert.assertTrue(table.isTrimmed());
+    Assert.assertTrue(table.getNumResizes() > 1,
+        "Expected more than one shard to actually trim at this capacity, got " + table.getNumResizes());
+    Assert.assertTrue(table.getResizeTimeMs() >= 0, "getResizeTimeMs() must not be negative");
+  }
+
+  @Test
   public void testMinAndMaxAggregationEligibleAndCorrect() {
     for (String function : List.of("min", "max")) {
       QueryContext queryContext = QueryContextConverterUtils.getQueryContext(

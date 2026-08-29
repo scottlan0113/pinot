@@ -18,10 +18,11 @@
  */
 package org.apache.pinot.core.data.table;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.lang.ref.Cleaner;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.common.utils.DataSchema.ColumnDataType;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
@@ -54,27 +55,41 @@ import org.apache.pinot.segment.spi.AggregationFunctionType;
 /// explicitly -- found by reading [org.apache.pinot.core.operator.combine.GroupByCombineOperator]'s real
 /// record layout (key columns then one slot per aggregation function), not assumed.
 ///
-/// **Known gaps, deliberately not solved here** (this is a prototype demonstrating the core data-flow is
-/// sound, not a production-ready implementation):
-/// - `finish(sort=true, ...)` sorts descending by the single aggregate value only -- does not reimplement
-///   [TableResizer]'s general ORDER BY comparator (arbitrary expressions, ASC order, ordering by key
-///   columns, multi-expression ORDER BY are all unsupported here even though `Table`'s contract doesn't
-///   forbid them for an eligible query -- callers of this class must not present it with such a query).
-/// - `getNumResizes()`/`getResizeTimeMs()` are coarse: [ShardedOffHeapGroupTable] currently only tracks
-///   *whether* any shard was trimmed ([ShardedOffHeapGroupTable#anyShardTrimmed()]), not a resize count or
-///   timing breakdown per shard the way [IndexedTable] tracks for the on-heap implementations.
-/// - Arena/native-memory lifecycle: `close()` is called at the end of `finish()`, once results have been
-///   extracted into `_topRecords`. If `finish()` is never reached (query error/timeout before
-///   `mergeResults()`), the off-heap Arena leaks -- this is the exact "Arena lifecycle in a long-running
-///   server process" risk the design doc already lists as an open question, not newly discovered or
-///   solved here.
+/// **Three gaps flagged 2026-08-29, addressed same day:**
+/// - `finish(sort=true, ...)` used to sort descending by the single aggregate value only. Now reuses the
+///   inherited [#_tableResizer] (built correctly by the `IndexedTable` superclass constructor from the
+///   real `QueryContext`, exactly the same object `ConcurrentIndexedTable` etc. use) via
+///   [TableResizer#getTopRecords(Map, int, boolean)] -- real ORDER BY support (arbitrary expressions, ASC
+///   order, ordering by key columns, ties broken however Pinot's own comparator breaks them), not a
+///   hand-rolled approximation. The one real cost: building a `Map<Key, Record>` from the off-heap
+///   results, a one-time, post-off-heap-processing allocation -- doesn't reintroduce boxing into the
+///   actual upsert hot path, which is what the off-heap design was for in the first place.
+/// - `getNumResizes()`/`getResizeTimeMs()` were previously coarse placeholders (0-or-1, untracked 0ms).
+///   Now `getNumResizes()` reports the real per-shard trim count
+///   ([ShardedOffHeapGroupTable#numShardsTrimmed()]), and `getResizeTimeMs()` times the actual
+///   `finishAllShards()` call -- still coarser than [IndexedTable]'s own breakdown (which separates
+///   periodic upsert-time resizes from the final one; `ShardedOffHeapGroupTable` only ever resizes once,
+///   at `finishAllShards()`, so there is only one number to report), but a real measurement, not a
+///   hardcoded stand-in.
+/// - Arena/native-memory lifecycle: a [Cleaner]-registered safety net now closes `_shardedTable`'s Arena
+///   if this object becomes unreachable without `finish()` ever having run (query error/timeout before
+///   `mergeResults()`). This is a backstop, not a fix -- `Cleaner` actions only fire once the JVM notices
+///   the object is unreachable, which is not immediate or guaranteed-timely, so a leak is now BOUNDED
+///   (freed eventually) rather than UNBOUNDED (never freed until process restart), not eliminated. The
+///   real fix -- explicit cleanup tied to the query's own error/timeout handling -- needs real
+///   `GroupByCombineOperator` integration, out of scope for a still-standalone prototype.
 public class ShardedOffHeapIndexedTable extends IndexedTable {
   private static final Map<Key, Record> UNUSED_LOOKUP_MAP = Map.of();
   private static final int DEFAULT_NUM_SUB_SEGMENTS = 4; // DESIGN.md Sec 6.2's validated sweet spot
+  // One shared background thread for the whole JVM, the standard Cleaner usage pattern -- not one thread
+  // per table instance.
+  private static final Cleaner CLEANER = Cleaner.create();
 
   private final ShardedOffHeapGroupTable _shardedTable;
   private final int _aggregationColumnIndex;
+  private final Cleaner.Cleanable _cleanable;
   private boolean _finished;
+  private long _resizeTimeMs;
 
   /// @param numShards Not derived automatically -- see class Javadoc's "not yet wired into GroupByUtils".
   ///                   Caller picks this directly, matching how every benchmark/test in this
@@ -104,6 +119,10 @@ public class ShardedOffHeapIndexedTable extends IndexedTable {
     _shardedTable = new ShardedOffHeapGroupTable(numShards, perShardInitialCapacity, fullCapacity,
         /* adaptiveCapacity= */ false, DEFAULT_NUM_SUB_SEGMENTS, /* divideInitialCapacityAcrossSubSegments= */ true,
         _numKeyColumns, aggregationType);
+    // Safety net, not a fix -- see class Javadoc. The registered action (a method reference bound to
+    // _shardedTable, the receiver) must NOT capture `this`, or the ShardedOffHeapIndexedTable itself
+    // could never become unreachable and this Cleaner would never fire.
+    _cleanable = CLEANER.register(this, _shardedTable::close);
   }
 
   /// @return null if eligible, otherwise a human-readable reason -- returning the reason (not just a
@@ -166,26 +185,39 @@ public class ShardedOffHeapIndexedTable extends IndexedTable {
   public void finish(boolean sort, boolean storeFinalResult) {
     if (_finished) {
       return; // Table interface doesn't document finish() as idempotent, but the on-heap implementations
-              // are only ever called once per query (see GroupByCombineOperator); guard against double-close
-              // of the Arena if this is ever called twice, rather than assuming it won't be.
+              // are only ever called once per query (see GroupByCombineOperator); guard against double-clean
+              // of the Cleanable if this is ever called twice, rather than assuming it won't be.
     }
     _finished = true;
+
+    long startNanos = System.nanoTime();
     _shardedTable.finishAllShards();
-    List<Record> records = new ArrayList<>(_shardedTable.totalSize());
+    _resizeTimeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+    // Build a real Map<Key, Record> so the inherited _tableResizer (built correctly by the IndexedTable
+    // superclass constructor from the real QueryContext) can be reused for ORDER BY -- a one-time,
+    // post-off-heap-processing cost, not a per-upsert one, so this does not reintroduce boxing into the
+    // hot path the off-heap design exists to avoid.
+    Map<Key, Record> lookupMap = new HashMap<>(_shardedTable.totalSize());
     if (_numKeyColumns == 1) {
-      _shardedTable.forEachEntry((key, value) -> records.add(toRecord(key, value)));
+      _shardedTable.forEachEntry((key, value) -> {
+        Record record = toRecord(key, value);
+        lookupMap.put(new Key(new Object[]{key}), record);
+      });
     } else {
-      _shardedTable.forEachMultiColumnEntry((keys, value) -> records.add(toRecord(keys, value)));
+      _shardedTable.forEachMultiColumnEntry((keys, value) -> {
+        Record record = toRecord(keys, value);
+        lookupMap.put(new Key(boxKeys(keys)), record);
+      });
     }
-    if (sort) {
-      // Known gap -- see class Javadoc: descending by the single aggregate value only, not a general
-      // ORDER BY comparator.
-      records.sort((a, b) -> Double.compare(
-          ((Number) b.getValues()[_aggregationColumnIndex]).doubleValue(),
-          ((Number) a.getValues()[_aggregationColumnIndex]).doubleValue()));
+
+    if (_hasOrderBy) {
+      _topRecords = _tableResizer.getTopRecords(lookupMap, _resultSize, sort);
+    } else {
+      _topRecords = lookupMap.values();
     }
-    _topRecords = records;
-    _shardedTable.close();
+
+    _cleanable.clean(); // runs _shardedTable.close() exactly once, safe even if already run
   }
 
   private Record toRecord(int key, double value) {
@@ -196,13 +228,22 @@ public class ShardedOffHeapIndexedTable extends IndexedTable {
   }
 
   private Record toRecord(int[] keys, double value) {
-    // System.arraycopy cannot bulk-box int[] into Object[] -- copy element-by-element instead.
     Object[] values = new Object[_numKeyColumns + 1];
     for (int i = 0; i < _numKeyColumns; i++) {
-      values[i] = keys[i];
+      values[i] = keys[i]; // int -> Object autoboxes fine one element at a time
     }
     values[_aggregationColumnIndex] = value;
     return new Record(values);
+  }
+
+  // System.arraycopy cannot bulk-box int[] into Object[] -- copy element-by-element instead (this is the
+  // exact bug the tests caught in toRecord(int[], double) before this method existed to share the fix).
+  private Object[] boxKeys(int[] keys) {
+    Object[] boxed = new Object[keys.length];
+    for (int i = 0; i < keys.length; i++) {
+      boxed[i] = keys[i];
+    }
+    return boxed;
   }
 
   @Override
@@ -212,13 +253,11 @@ public class ShardedOffHeapIndexedTable extends IndexedTable {
 
   @Override
   public int getNumResizes() {
-    // Coarse -- see class Javadoc. ShardedOffHeapGroupTable currently reports only a boolean, not a count.
-    return _shardedTable.anyShardTrimmed() ? 1 : 0;
+    return _shardedTable.numShardsTrimmed();
   }
 
   @Override
   public long getResizeTimeMs() {
-    // Not tracked -- see class Javadoc.
-    return 0;
+    return _resizeTimeMs;
   }
 }

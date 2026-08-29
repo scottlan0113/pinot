@@ -124,11 +124,11 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
   private final Arena _arena;
   private final OffHeapGroupTable[][] _shards; // [outer shard][sub-segment]
   private final ReentrantReadWriteLock[][] _locks; // [outer shard][sub-segment]
-  // Set during finishAllShards() (sequential across shards, see its own Javadoc, so a plain boolean is
-  // safe -- no concurrent writers). Lets a caller ask "did any shard actually discard records," the
-  // signal IndexedTable.isTrimmed() reports for the on-heap tables (ShardedOffHeapIndexedTable needs
-  // this to implement that same contract).
-  private boolean _anyShardTrimmed;
+  // Set during finishAllShards() (sequential across shards, see its own Javadoc, so a plain int is safe
+  // -- no concurrent writers). Lets a caller ask how many shards actually discarded records, the signal
+  // IndexedTable.getNumResizes()/isTrimmed() report for the on-heap tables (ShardedOffHeapIndexedTable
+  // needs this to implement that same contract).
+  private int _numShardsTrimmed;
 
   // Adaptive-capacity bookkeeping, one slot per OUTER shard -- shared across that shard's
   // sub-segments, which each hold their own independent lock, so these must be genuinely
@@ -431,7 +431,7 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
           }
         }
         if (primary.trimTo(capacityFor(i))) {
-          _anyShardTrimmed = true;
+          _numShardsTrimmed++;
         }
       } finally {
         for (int j = 0; j < _numSubSegments; j++) {
@@ -441,11 +441,17 @@ public class ShardedOffHeapGroupTable implements AutoCloseable {
     }
   }
 
-  /// Valid post-finishAllShards() only. True if trimming actually discarded records on at least one
-  /// shard -- false if every shard's final size was already at or under its capacity, in which case
-  /// nothing was lost regardless of capacity/adaptive-capacity settings.
+  /// Valid post-finishAllShards() only. How many of the numShards shards actually discarded records --
+  /// 0 if every shard's final size was already at or under its capacity, in which case nothing was lost
+  /// regardless of capacity/adaptive-capacity settings.
+  public int numShardsTrimmed() {
+    return _numShardsTrimmed;
+  }
+
+  /// Valid post-finishAllShards() only. Convenience for callers that only care whether ANY shard
+  /// discarded records, not how many -- see [#numShardsTrimmed()].
   public boolean anyShardTrimmed() {
-    return _anyShardTrimmed;
+    return _numShardsTrimmed > 0;
   }
 
   /// Valid post-finishAllShards() only -- see forEachEntry().

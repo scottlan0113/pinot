@@ -1379,16 +1379,48 @@ plus the existing 21 clean across 4 runs; existing suite unaffected.
 `IndexedTable.isTrimmed()` is part of the real contract `GroupByCombineOperator` calls, and
 nothing before this tracked that signal.
 
-**Known gaps, deliberately not solved** (this is a prototype demonstrating the core data-flow is
-sound, not a production-ready implementation — see the class's own Javadoc for the same list):
-`finish(sort=true, ...)` sorts descending by the single aggregate value only, not a real
-`TableResizer`-equivalent general ORDER BY comparator (arbitrary expressions, ascending order,
-ordering by key columns are all unsupported); `getNumResizes()`/`getResizeTimeMs()` are coarse
-(a 0-or-1 count and an untracked 0ms, since `ShardedOffHeapGroupTable` only reports a boolean,
-not a count or timing breakdown); and the Arena/native-memory lifecycle risk the design doc
-already flagged as an open question is unchanged — `close()` runs at the end of `finish()`, so a
-query that errors out or times out before reaching that point would leak the off-heap Arena, a
-risk this prototype surfaces again rather than resolves.
+**All three known gaps addressed 2026-08-29** (same day, follow-up to a user request to try
+closing them rather than leaving them as accepted limitations):
+
+1. **Real ORDER BY, not a hand-rolled descending-by-aggregate approximation.** The inherited
+   `_tableResizer` field — built correctly by the `IndexedTable` superclass constructor from the
+   real `QueryContext`, the exact same object `ConcurrentIndexedTable` uses — was sitting unused.
+   `finish()` now builds a real (one-time, post-off-heap-processing) `Map<Key, Record>` from the
+   off-heap results and calls `_tableResizer.getTopRecords(map, resultSize, sort)`, exactly like
+   the on-heap tables do. This is a genuine capability upgrade, not a workaround: ASC order and
+   ordering by a GROUP BY key column (neither possible before) both now work, verified by two new
+   tests (`testFinishSupportsAscendingOrderBy`, `testFinishSupportsOrderingByKeyColumn` — the
+   latter deliberately upserts aggregate values that would sort differently under the old
+   aggregate-only comparator, so the test can only pass if key-column ordering is genuinely being
+   used). The existing descending-by-aggregate test still passes unchanged, now exercised through
+   the real mechanism instead of the hand-rolled one.
+2. **Real resize stats, not hardcoded placeholders.** `ShardedOffHeapGroupTable.anyShardTrimmed()`
+   (a boolean) became `numShardsTrimmed()` (an int count, `anyShardTrimmed()` kept as a
+   convenience derived from it) — `getNumResizes()` now reports that real count.
+   `getResizeTimeMs()` now times the actual `finishAllShards()` call. Verified by
+   `testResizeStatsReflectRealTrimming` (a deliberately tiny `fullCapacity=2` forces real trimming
+   across many shards, asserting `getNumResizes() > 1`, not just non-zero).
+3. **A `Cleaner`-based safety net for the Arena leak on query error/timeout** — genuinely a
+   backstop, not a fix, and said so deliberately rather than overclaiming: `java.lang.ref.Cleaner`
+   (one shared instance for the whole JVM, the standard pattern) registers `_shardedTable::close`
+   against `this`, using `Cleaner.Cleanable.clean()` (not a raw `close()` call) so the action is
+   guaranteed to run at most once whether triggered explicitly (inside `finish()`) or by the JVM
+   noticing the object is unreachable. This bounds the leak (memory is freed once GC eventually
+   collects the abandoned table) rather than eliminating it (GC timing is not immediate or
+   guaranteed) — the real fix still needs the query engine's own error/timeout handling to
+   explicitly close the table, which requires actual `GroupByCombineOperator` integration, out of
+   scope for a standalone prototype. **Deliberately not unit-tested**: verifying GC-triggered
+   cleanup empirically means a test that forces `System.gc()` and polls with a timeout — a
+   fundamentally non-deterministic pattern that would make the suite flaky for a benefit (catching
+   a regression in a three-line standard-pattern JDK API call) that doesn't justify the cost.
+   Confidence instead rests on `Cleaner` being a mature, well-tested JDK primitive (introduced
+   specifically to replace unreliable `finalize()`) and the usage here matching its documented
+   pattern exactly (a static shared instance; the registered action captures the resource being
+   cleaned, not `this`, so the table itself can still become unreachable) — reviewed, not
+   re-proven from scratch.
+
+All existing tests (27) plus 3 new ones (30 total) clean across 4 runs; no regression to any
+previously-verified behavior.
 
 **Still not wired into `GroupByUtils`/`GroupByCombineOperator`** — this section closes the "does
 the core adapter idea actually work against real Pinot types" question, not the "should we ship
