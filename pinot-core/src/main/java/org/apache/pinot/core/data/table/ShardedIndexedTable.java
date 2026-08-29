@@ -29,6 +29,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.DoubleAccumulator;
 import java.util.concurrent.atomic.DoubleAdder;
+import java.util.concurrent.atomic.LongAdder;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.core.query.request.context.QueryContext;
 
@@ -256,7 +257,9 @@ public class ShardedIndexedTable extends BaseTable implements Table {
     // Require enough samples before trusting top1Share at all -- with only a handful of records seen,
     // top1Share is dominated by noise (e.g. exactly 1.0 after a single upsert), which would otherwise
     // trigger an immediate, meaningless jump straight to the smallest tier on essentially every shard.
-    private static final double MIN_SAMPLES_BEFORE_ADAPTATION = 500;
+    // Gated on the real upsert count (_sampleCount below), NOT _runningTotal's sum of values -- see the
+    // bug fixed 2026-08-29 (DESIGN.md Sec 4.6) on updateSignalAndMaybeShrink.
+    private static final long MIN_SAMPLES_BEFORE_ADAPTATION = 500;
 
     private final int _valueColumnIndex;
     private final int _mediumTrimSize;
@@ -266,6 +269,10 @@ public class ShardedIndexedTable extends BaseTable implements Table {
 
     private final DoubleAdder _runningTotal = new DoubleAdder();
     private final DoubleAccumulator _runningMax = new DoubleAccumulator(Double::max, 0.0);
+    // A real upsert COUNT, separate from _runningTotal (a sum of VALUES) -- see the bug this fixed,
+    // documented on updateSignalAndMaybeShrink below and in DESIGN.md Sec 4.6. Same fix idiom
+    // ShardedOffHeapGroupTable's own port of this gate already uses (its _sampleCount field).
+    private final LongAdder _sampleCount = new LongAdder();
     // 0 = full (initial), 1 = medium, 2 = small. Only ever moves up (shrinks), guarded by CAS below.
     private final AtomicInteger _currentTier = new AtomicInteger(0);
 
@@ -296,6 +303,17 @@ public class ShardedIndexedTable extends BaseTable implements Table {
     /// value -- a hot key's dominance only shows up in its accumulated total (e.g. 1000 hits x 1.0 each),
     /// never in any single call's raw contribution, so it requires one extra lookup of the just-updated
     /// record from `_lookupMap` (O(1) hash lookup, not a rescan).
+    ///
+    /// BUG FIXED 2026-08-29 (DESIGN.md Sec 4.6): the minimum-sample gate below used to compare
+    /// `_runningTotal.sum()` -- a SUM OF VALUES -- against `MIN_SAMPLES_BEFORE_ADAPTATION`, a threshold
+    /// meant to represent a SAMPLE COUNT. Coincidentally correct only when every value is 1.0 (every
+    /// verification in DESIGN.md Sec 4.5 happened to use exactly that), so it went undetected until
+    /// Direction C's own port of this same gate was tested against non-unit-valued data and hit the
+    /// identical bug. A single upsert whose value alone exceeded the threshold could open the gate after
+    /// just one real sample, and since one sample's top1Share is trivially 1.0, jump straight to the
+    /// smallest tier -- exactly the failure mode this gate exists to prevent. Fixed with a real,
+    /// independent `_sampleCount` (`LongAdder`, incremented once per upsert), same idiom
+    /// `ShardedOffHeapGroupTable` already uses for its own (already-correct) copy of this gate.
     private void updateSignalAndMaybeShrink(Key key, Record record) {
       int currentTier = _currentTier.get();
       if (currentTier == 2) {
@@ -307,6 +325,7 @@ public class ShardedIndexedTable extends BaseTable implements Table {
         return; // not a numeric aggregate at this column -- signal not applicable, stay at full capacity
       }
       _runningTotal.add(((Number) rawValue).doubleValue());
+      _sampleCount.increment();
 
       Record stored = _lookupMap.get(key);
       Object storedValue = stored != null ? stored.getValues()[_valueColumnIndex] : null;
@@ -314,10 +333,10 @@ public class ShardedIndexedTable extends BaseTable implements Table {
         _runningMax.accumulate(((Number) storedValue).doubleValue());
       }
 
-      double total = _runningTotal.sum();
-      if (total < MIN_SAMPLES_BEFORE_ADAPTATION) {
+      if (_sampleCount.sum() < MIN_SAMPLES_BEFORE_ADAPTATION) {
         return; // not enough evidence yet -- top1Share is noise-dominated at very low sample counts
       }
+      double total = _runningTotal.sum();
       double top1Share = _runningMax.get() / total;
       int targetTier = top1Share < MEDIUM_TOP1_SHARE_THRESHOLD ? 0
           : top1Share < SMALL_TOP1_SHARE_THRESHOLD ? 1 : 2;
