@@ -1449,18 +1449,35 @@ for any of the three benchmarks; `concurrentIndexedTable` ranges 406,500-431,575
 - **`Key`/`Record` boundary cost**: 23,558.6 / 15,401.5 ≈ **1.53x** — real, measurable overhead
   from per-upsert `Object[]` boxing and the one-time `Map<Key, Record>` build in `finish()`, but
   small relative to the next number.
-- **Path 1 adapter vs. today's real production baseline**: 416,403.2 / 23,558.6 ≈ **17.7x**. This
-  margin is substantially wider than the ~6.9x `ShardedOffHeapGroupTable`-direct-vs-baseline
-  number elsewhere in this document (§4.5) — not a contradiction, since that number and this one
-  measure different things (different harness, different cardinality/thread shape, and critically
-  §4.5's baseline is a different comparison point than plain `ConcurrentIndexedTable` under this
-  exact 10-thread/50K-cardinality/order-by-enabled shape, which had not been measured before in
-  this investigation). Plausible mechanism, not yet independently confirmed by profiling:
+- **Path 1 adapter vs. today's real production baseline**: 416,403.2 / 23,558.6 ≈ **17.7x**. Raw
+  off-heap without the `Key`/`Record` boundary at all: 416,403.2 / 15,401.5 ≈ **27.0x**.
+- **Correction**: an earlier version of this section compared the 17.7x number against the "~6.9x"
+  figure in §4.5 and called it a wider-but-not-contradictory margin. That comparison was wrong —
+  §4.5's ~6.9x is **Direction A**'s own number (`ShardedIndexedTable`/`AdaptiveConcurrentIndexedTable`,
+  the on-heap sharded design, not Direction C at all), measured at cardinality 10,000, not 50,000.
+  This benchmark is actually the **first time in this investigation Direction C (via the Path 1
+  adapter) has been measured directly against `ConcurrentIndexedTable` in the same JMH run** — every
+  earlier Direction C number (§6.1-6.8) was reported relative to Direction A instead.
+- **A real, useful cross-check does exist**, once the correct comparison is made: §4.5's own
+  `ConcurrentIndexedTable` baseline — 407,413 ± 11,895 us/op, cardinality 10,000, but the *same*
+  10 threads × 100,000 records = 1,000,000 total upserts this benchmark also uses — lands within
+  **2.2%** of this run's `ConcurrentIndexedTable` number (416,403.2 us/op, cardinality 50,000).
+  Two independently-written benchmark classes, different sessions, different cardinality, landing
+  this close is strong corroborating evidence for both — consistent with upsert cost here being
+  driven mainly by per-call lock overhead (constant at 1,000,000 upserts either way) rather than by
+  map cardinality in this range, which also explains why 5x more distinct keys barely moved the
+  number.
+- Chaining §4.5's Direction-A-vs-`ConcurrentIndexedTable` ratio (~6.9x) with Direction C's own
+  previously-reported margin over Direction A (1.81x-3.00x fixed capacity, §6.2) gives a rough
+  implied range of ~12.5x-20.7x for Direction C vs. `ConcurrentIndexedTable` — **not rigorous**
+  (crosses two different benchmark harnesses/cardinalities), but the same order of magnitude as
+  this run's own direct 17.7x/27.0x measurements, not a contradiction of the standing story.
+- Plausible mechanism for the gap, not yet independently confirmed by profiling:
   `ConcurrentIndexedTable` funnels all 10 threads through one `ReentrantReadWriteLock` guarding one
-  shared map on every single upsert (1,000,000 total), while the sharded design spreads that same
-  work across `NUM_SHARDS=64` shards (each further split into `DEFAULT_NUM_SUB_SEGMENTS=4`) — this
-  matches a cost driver already identified earlier in this investigation, that
-  `ReentrantReadWriteLock`'s per-call overhead is a real fixed cost, not just a contention effect.
+  shared map on every single upsert, while the sharded design spreads that same work across
+  `NUM_SHARDS=64` shards (each further split into `DEFAULT_NUM_SUB_SEGMENTS=4`) — matches the cost
+  driver already identified earlier in this investigation, that `ReentrantReadWriteLock`'s per-call
+  overhead is a real fixed cost, not just a contention effect.
 - No resize occurred on the `ConcurrentIndexedTable` side during this run (cardinality 50,000 stays
   well under `TRIM_THRESHOLD=1,000,000`), so the gap reflects steady-state upsert cost, not
   resize/trim behavior.
