@@ -274,11 +274,39 @@ keeping full capacity per shard in the first place (§4.2).
   already reported to Jackie would not have held under a realistic production workload. Post-fix,
   the spot-check matches §4.5's original claims on both metrics at both skew levels.
   <br><br>
-  **Not done**: a full re-run of §4.5's entire sweep (all 3 skew levels x all 4 cardinalities,
-  320K-20M) — this spot-check used only the cheapest cardinality point (320K) at two skew levels
-  (0.15, 1.00) chosen to bracket the "should be safe" vs. "should shrink" regimes. Whether to
-  redo the full table before this reaches Jackie again is a reporting decision, not a technical
-  one — raised, not resolved, here.
+  **Full §4.5 sweep re-run 2026-08-29, post-fix only** (all 3 skew levels x all 4 cardinalities,
+  320K-20M, same realistic-value methodology, current HEAD — the fix's existence and impact were
+  already proven via the worktree before/after above, so this run confirms the fix holds across
+  the whole originally-tested parameter space rather than re-demonstrating the bug):
+
+  | Skew | Cardinality | Fixed (new) | Adaptive (new) | Reduction (new) | §4.5 original (fixed/adaptive/pct) | Recall (both) |
+  |---|---|---|---|---|---|---|
+  | 0.15 | 320K | 304,436 | 304,436 | 0.0% | 304,605 / 304,467 / ~0% | 1.00 |
+  | 0.50 | 320K | 286,434 | 109,680 | 61.7% | 286,588 / 114,598 / 60% | 1.00 |
+  | 0.50 | 1M | 556,422 | 301,765 | 45.8% | 557,000 / 352,464 / 37% | 1.00 |
+  | 0.50 | 5M | 836,902 | 766,873 | 8.4% | 837,385 / 790,259 / 6% | 1.00 |
+  | 0.50 | 20M | 941,999 | 902,044 | 4.2% | 942,449 / 929,560 / 1% | 1.00 |
+  | 1.00 | 320K | 149,387 | 7,914 | 94.7% | 149,540 / 7,762 / 94.8% | 1.00 |
+  | 1.00 | 1M | 216,939 | 8,210 | 96.2% | 217,142 / 8,386 / 96.1% | 1.00 |
+  | 1.00 | 5M | 300,470 | 7,892 | 97.4% | 301,016 / 7,591 / 97.5% | 1.00 |
+  | 1.00 | 20M | 360,266 | 7,968 | 97.8% | 361,025 / 8,274 / 97.7% | 1.00 |
+
+  Recall@10 is 1.00 at every single point, both fixed and adaptive — no correctness regression
+  anywhere in the full table. Skew=1.00 matches the original claims closely at all 4 cardinalities
+  (within ~1-3% relative), consistent with the earlier finding that this skew level was never
+  materially affected by the bug. Skew=0.15 matches exactly. **Skew=0.50 (the borderline regime)
+  saves MORE memory under realistic values than §4.5 originally claimed at every cardinality** —
+  e.g. 4.2% reduction at 20M vs. the originally-claimed 1%, growing to a bigger relative gap as
+  cardinality increases. Not a correctness concern (recall stays perfect throughout) and not the
+  same failure direction as the bug (which caused unsafe UNDER-reporting of risk, not conservative
+  over-saving) — most likely explanation is that top1Share, being value-weighted, responds to
+  real value variance in ways a constant-value workload can't reproduce, and skew=0.5 sits closer
+  to the tier thresholds than skew=0.15 or skew=1.00 do, making it more sensitive to this
+  difference either way. Not independently confirmed by profiling; flagged as an open, benign
+  discrepancy rather than asserted.
+
+  Whether/how to communicate any of this to Jackie — the original bug, or this skew=0.5 memory
+  discrepancy — is a reporting decision, not a technical one, and stays with the user.
 
 ## 5. Direction B: per-thread tables + off-heap (initial prototype)
 
