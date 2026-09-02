@@ -101,19 +101,91 @@ partial view independently before merging, which can silently drop a key whose c
 value across threads would have made the final top-K, and duplicates any key seen by more
 than one thread's table.
 
-### 4.2 The resulting memory ceiling problem
+### 4.2 The resulting memory problem: sharding makes trimming inert
 
 Each shard is configured with the **same** full `resultSize`/`trimSize`/`trimThreshold` a
-single `ConcurrentIndexedTable` would use for the whole table (not divided by `numShards`) —
-dividing the budget per shard was found to measurably hurt recall on moderately-skewed data.
-This means the aggregate memory ceiling across all shards is `numShards * trimSize` — e.g.
-64 * 5000 = 320,000, vs. the un-sharded design's fixed 5,000. Direct measurement confirmed
-this ceiling is genuinely approached (>99%) at true group cardinality >= 1M — a real ~64x
-memory cost at exactly the cardinality #10498 is concerned with.
+single `ConcurrentIndexedTable` would use for the whole table, not divided by `numShards`
+(`ShardedIndexedTable` constructor). A shard trims only when *its own* map reaches
+`trimThreshold` (`ConcurrentIndexedTable.upsert`), and sharding divides the key population by
+`numShards`, so a threshold that would have fired on the whole table often fires on no shard
+at all. The result is not a raised memory ceiling — it is the loss of any ceiling.
+
+**Correction (2026-09-01).** An earlier version of this section said the aggregate ceiling was
+`numShards * trimSize` (64 * 5000 = 320,000) and that direct measurement confirmed it
+"genuinely approached (>99%)" at cardinality >= 1M. Both statements are wrong, and they
+contradicted §4.5's own memory table, which reports 557,000–942,449 entries held at those
+cardinalities — *above* the claimed ceiling, not 99% of it. `ShardCeilingSweepTest.sweep`
+measures the actual behaviour (uniform distinct keys, `trimSize=5,000`,
+`trimThreshold=1,000,000` — the configuration §4.5 used):
+
+| cardinality | numShards | held entries | resizes | old claimed ceiling |
+|---|---|---|---|---|
+| 1,000,000 | 1 (un-sharded) | 5,000 | 1 | 5,000 |
+| 1,000,000 | 4 | 1,000,000 | 0 | 20,000 |
+| 1,000,000 | 8 / 16 / 32 / 64 | 1,000,000 | 0 | 40,000 … 320,000 |
+
+The un-sharded table trims to 5,000; every sharded configuration holds all 1,000,000. That is
+a **200x** cost, not ~64x, and it is already fully present at `numShards=4` — so "use fewer
+shards" does not mitigate it. The rule measured across the sweep is:
+
+> held entries = `numShards * min(per-shard key population, trimSize)` when the threshold
+> fires, and the full distinct-key count when it does not. Trimming is inert whenever
+> `cardinality / numShards < trimThreshold`, and evicts nothing even when it does fire if
+> `cardinality / numShards < trimSize`.
+
+At `numShards=64` and `trimSize=5,000`, the lowest cardinality at which sharding bounds memory
+at all is therefore around 320,000.
+
+**`trimSize` and `trimThreshold` are separate knobs, and were previously conflated.** The
+earlier claim that "dividing the budget per shard measurably hurts recall" is supported for
+`trimSize` (§4.5, §5.7: a small fixed capacity drops recall in the mild-skew band). It was
+never tested for `trimThreshold`, which is what decides whether a shard trims at all.
+`ShardCeilingSweepTest.recallSweep` measures that (Zipfian keys, non-constant values 1–10,
+cardinality 200,000, 1,000,000 upserts, `trimSize=5,000`, base `trimThreshold=50,000`,
+single-threaded, seeded):
+
+| skew=0.15 configuration | held entries | recall@10 |
+|---|---|---|
+| un-sharded baseline | 43,558 | 0.60 |
+| 64 shards, undivided threshold (current code) | 198,376 (every key; 0 trims) | 1.00 |
+| 4 shards, `trimThreshold / numShards` | 38,222 | 0.70 |
+| 16 shards, `trimThreshold / numShards` | 80,000 (= `numShards * trimSize`) | 1.00 |
+
+Dividing `trimThreshold` beat the un-sharded baseline on both axes and did not hurt recall
+anywhere it was measured. skew 0.5 and 1.0 hold recall@10 = 1.00 in every configuration, so
+skew 0.15 is the only band where the number moves — and there the ground truth is a near-tie
+(rank 10 sums to 133, rank 1,000 to 76, `groundTruthSeparation`), so a recall difference in
+that band is reordering among indistinguishable keys, not a lost hot key. The current code's
+perfect recall is not a quality result: it is what "never trimmed" looks like.
+
+Neither simple threshold policy is usable as-is. `trimThreshold / numShards` with no floor
+thrashes — 942,198 `resize()` calls at 16 shards, almost all returning immediately at
+`TableResizer.resizeRecordsMap`'s `numRecordsToEvict <= 0` guard, but each one taking the
+shard's exclusive write lock, which is the contention sharding exists to remove. Flooring the
+per-shard threshold at `4 * trimSize` removes the thrash (44 calls) but goes inert again at 16
+and 64 shards, where the floor exceeds the per-shard population. A usable rule has to come
+from the expected per-shard key population, which couples `numShards`, `trimSize` and expected
+cardinality into one decision instead of three independent constants. This is open.
+
+**This is also what §4.3's adaptive capacity is actually doing.** When a shard narrows a tier it
+shrinks its threshold along with its trim size — `_mediumTrimThreshold = (trimSize / 10) * 4`,
+`_smallTrimThreshold = (trimSize / 100) * 4` — collapsing a 1,000,000 threshold to 2,000 or 200.
+So the large reductions §4.5 reports are not only "each shard keeps fewer entries"; they are a
+shard that trims at all versus one that never does. It also explains the row that previously
+looked like a null result: at skew 0.15 adaptive stays in the FULL tier, keeps the undivided
+threshold, and reports ~0% reduction — not because narrowing was unnecessary there, but because
+nothing ever fired. Mild skew is exactly where the memory problem is least addressed today, and
+the adaptive signal is switched off in the wiring currently proposed.
+
+**Limits of this measurement.** Single-threaded, so the write-lock cost of thrashing resizes is
+inferred from the lock structure, not measured. `trimThreshold=50,000` was chosen so trimming
+engages at a tractable cardinality; at the production-shaped 1,000,000 the same effects need
+cardinality >= 1M, as the first table shows. Dividing `trimSize` was not re-tested, and the
+§4.5/§5.7 recall risk for doing so stands. recall@10 only; per-key value accuracy unchecked.
 
 ### 4.3 Adaptive capacity design
 
-To recover most of the ceiling cost without the correctness risk of a fixed, uniformly small
+To recover most of that memory cost without the correctness risk of a fixed, uniformly small
 per-shard capacity, each shard can optionally narrow its own trim capacity at runtime based
 on a local signal, instead of keeping the full budget for its entire lifetime.
 
@@ -350,7 +422,7 @@ memory problem, not the same one:
 
 | | Off-heap | Adaptive capacity (Direction A) |
 |---|---|---|
-| Reduces | Cost **per entry held** (object overhead, GC pressure) | **Count** of entries held (the ceiling) |
+| Reduces | Cost **per entry held** (object overhead, GC pressure) | **Count** of entries held (§4.2) |
 | Does not reduce | Entry count | Per-entry storage cost |
 
 The two are, in principle, stackable rather than competing: a design could shard (or use

@@ -53,11 +53,19 @@ import org.apache.pinot.core.query.request.context.QueryContext;
 /// block combine threads writing to other shards.
 ///
 /// Each shard is configured with the SAME `resultSize`/`trimSize`/`trimThreshold` as a single
-/// [ConcurrentIndexedTable] would use for the whole table (not divided by `numShards`). Empirically,
-/// dividing this budget across shards measurably hurts recall on moderately-skewed data; keeping the
-/// full per-shard budget matches [ConcurrentIndexedTable]'s correctness while still avoiding duplication
-/// (the "extra" capacity is unused headroom in shards with fewer distinct keys, not redundant copies of
-/// the same data).
+/// [ConcurrentIndexedTable] would use for the whole table (not divided by `numShards`). Keeping the
+/// full per-shard `trimSize` is deliberate and matches [ConcurrentIndexedTable]'s correctness: a
+/// smaller fixed capacity measurably hurts recall in the mild-skew band (DESIGN.md Sec 4.5, Sec 5.7).
+/// It avoids duplication too -- the "extra" capacity is unused headroom in shards with fewer distinct
+/// keys, not redundant copies of the same data.
+///
+/// The undivided `trimThreshold` is a separate matter, and a known problem rather than a design
+/// choice: a shard trims only when its OWN map reaches the threshold, so sharding divides the key
+/// population by `numShards` and the threshold can fire on no shard at all. Measured at cardinality
+/// 1M with `trimThreshold=1,000,000`, the un-sharded table trims to 5,000 while every configuration
+/// from `numShards=4` up holds all 1,000,000 entries. DESIGN.md Sec 4.2 has the numbers and corrects
+/// an earlier `numShards * trimSize` characterisation of this that was wrong; deriving a per-shard
+/// threshold is open. See `ShardCeilingSweepTest`.
 public class ShardedIndexedTable extends BaseTable implements Table {
   private final int _numShards;
   private final int _numKeyColumns;
@@ -207,11 +215,12 @@ public class ShardedIndexedTable extends BaseTable implements Table {
   /// keeping the full budget for its entire lifetime like a plain shard does.
   ///
   /// Background (see #10498 / #11924 investigation): keeping every shard at the full `trimSize` avoids
-  /// the correctness risk that a smaller fixed capacity has on mildly-skewed data (verified: recall drops
-  /// as low as 80% at skew~0.15 with a small fixed per-shard capacity), but it means the aggregate memory
-  /// ceiling across all shards is `numShards * trimSize` -- confirmed to be genuinely approached (>99% of
-  /// ceiling) at true group cardinality >=1M, a real ~64x cost at exactly the cardinality #10498 cares
-  /// about.
+  /// the correctness risk that a smaller fixed capacity has on mildly-skewed data (recall drops to 80%
+  /// at skew~0.15 with a per-thread capacity of 100 in DESIGN.md Sec 5.7's Direction B sweep, and as low
+  /// as 0% in Direction A's own `ShardSizeCalibration`, Sec 4.5). The cost is that the aggregate entry
+  /// count grows with `numShards`, and -- because `trimThreshold` is undivided too -- trimming can stop
+  /// firing altogether. DESIGN.md Sec 4.2 has the measured numbers, and corrects an earlier
+  /// `numShards * trimSize` / ">99% of ceiling at >=1M" characterisation of this that was wrong.
   ///
   /// Signal: `top1Share` = (this shard's single largest-value key's value) / (sum of all this shard's
   /// values). Validated (in scratch simulation, not yet re-verified against this real implementation)
