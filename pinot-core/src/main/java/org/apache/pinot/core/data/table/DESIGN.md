@@ -1623,8 +1623,8 @@ implementations across the same axes:
 | | A: sharding + adaptive capacity | B: per-thread + off-heap | C: sharding + off-heap |
 |---|---|---|---|
 | Performance vs. baseline | ~6.9x faster than `ConcurrentIndexedTable` (§4.5) | ~19-22% faster + 82-91% less GC than on-heap per-thread (§5.6) | JMH-confirmed under both uniform and skewed workloads: fixed capacity 1.81-3.00x faster (3.00x with sub-segmenting on uniform data, its biggest measured margin, §6.2), adaptive capacity 1.09-1.95x faster (wider margin under the skew #10498 targets) + ~0 GC vs. Direction A itself (§6.4) |
-| Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew (§4.5) — **but see the caveat below: this signal likely has the same unverified-under-realistic-values gap Direction C's own port had, not yet fixed or re-confirmed in Direction A itself (§4.6)** | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) with the corrected gate — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A's claimed numbers; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
-| Correctness risk | None found (§4.5), but see the memory-row caveat — the verification behind "none found" may itself need redoing | **Real, confirmed, unmitigated**: recall@10 drops to 62-92% at mild skew (§5.7), as low as 0% in the worst case, reproducing the original `ShardSizeCalibration` finding that motivated sharding in the first place | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3), unaffected by the gate bug (Direction C's own gate was already fixed and re-verified) |
+| Memory | Tunable via `top1Share`: 0% to 96-98% reduction depending on skew — gate bug found, fixed, and re-verified with a full nine-point skew/cardinality re-sweep, recall@10 = 1.00 at every point (§4.5, §4.6). Note the 0% end is mild skew, where the shard stays in the FULL tier and, per §4.2, therefore never trims at all | Duplication factor 1.1x-6.1x depending on skew, unmitigated (§5.5) | No duplication (key-hash routing); `top1Share` ported (§6.5) with the corrected gate — 0% to ~98% reduction depending on skew, stable from 320K to 20M cardinality, matching Direction A's claimed numbers; two gate-tuning bugs found and fixed, verified against both a uniform and a skewed workload together |
+| Correctness risk | None found (§4.5), re-confirmed after the gate fix across all nine skew/cardinality points | **Real, confirmed, unmitigated**: recall@10 drops to 62-92% at mild skew (§5.7), as low as 0% in the worst case, reproducing the original `ShardSizeCalibration` finding that motivated sharding in the first place | None found — same key-hash-routing guarantee as A, confirmed under real concurrent threads (§6.3), unaffected by the gate bug (Direction C's own gate was already fixed and re-verified) |
 | Wired into query engine | No (§4.6) | No (§5.8) | No (§6.6) |
 | Regression tests | No (§4.6) | No (§5.8) | Yes — `ShardedOffHeapGroupTableTest.java`, runs under `mvn test` (§6.6) |
 
@@ -1637,18 +1637,20 @@ adaptive capacity (§6.2).** Reasoning, axis by axis:
   that motivated sharding in the first place (§4.2, §5.2). A design that can silently return
   wrong top-K results under realistic skew is not viable regardless of its performance or GC
   characteristics, unless a mitigation is found — none has been attempted. Direction A and C
-  both have the same key-hash-routing guarantee and no correctness risk found — but Direction
-  A's own adaptive-capacity verification needs to be redone in light of the likely gate bug
-  found while researching this recommendation (§4.6); Direction C's equivalent bug was found,
-  fixed, and independently re-verified against both a uniform and a skewed workload together.
+  both have the same key-hash-routing guarantee and no correctness risk found. Direction A's
+  own adaptive-capacity verification was redone after the gate bug found while researching this
+  recommendation was fixed (§4.6), and recall@10 held at 1.00 across all nine skew/cardinality
+  points; Direction C's equivalent bug was found, fixed, and independently re-verified against
+  both a uniform and a skewed workload together.
 - **Performance now clearly favors C.** Every configuration measured has Direction C faster than
   Direction A, from a conservative ~9% (adaptive, uniform workload, no sub-segmenting) up to
   3.00x (fixed capacity, sub-segmented, uniform workload) — and C's write-lock design was
   directly compared against a finer-grained alternative (lost) and then improved via
   sub-segmenting (won, substantially) rather than left as an unexamined simplification.
-- **Memory ties, once Direction A's own gate is fixed and re-verified** — same signal, same
-  thresholds, same shrink behavior, ported deliberately to match. Until that re-verification
-  happens, Direction C's numbers are the ones with fresher, more trustworthy confirmation.
+- **Memory ties** — same signal, same thresholds, same shrink behavior, ported deliberately to
+  match. Direction A's gate has since been fixed and re-verified (§4.6), so this is now a
+  measured tie rather than a pending one. Neither direction addresses the mild-skew band, where
+  the signal stays in the FULL tier and sharding leaves trimming inert (§4.2).
 - **Operational cost is the one place Direction A is simpler**: on-heap only, no off-heap Arena
   lifecycle to manage. This is a real, non-zero cost of choosing C, though nothing has actually
   gone wrong with it across the extensive concurrency testing in §6.3/§6.2's sub-segmenting work.
